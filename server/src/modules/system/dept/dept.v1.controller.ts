@@ -12,7 +12,7 @@ import { buildXlsx } from '../../../utils/xlsx.util'
 import { CreateDeptDto } from './dto/create-dept.dto'
 import { UpdateDeptDto } from './dto/update-dept.dto'
 import { DeptEntity } from './entities/dept.entity'
-import { DeptService } from './dept.service'
+import { DeptService, type DeptWithOperators } from './dept.service'
 
 /**
  * 部门管理接口 V1：/api/v1/depts/**
@@ -40,10 +40,8 @@ export class DeptV1Controller {
   @ApiOkResponse({ description: '部门列表（统一分页结构；size = total，一次全量返回）', type: Pagination })
   @Perms('system:dept:list')
   @Get()
-  async list(@Query() query: { keyword?: string }): Promise<Pagination<DeptEntity>> {
-    const keyword = query.keyword?.trim()
-    const all = await this.deptService.listAll()
-    return toPagination(keyword ? all.filter(dept => (dept.departName ?? '').includes(keyword)) : all)
+  async list(@Query() query: { keyword?: string }): Promise<Pagination<DeptWithOperators>> {
+    return toPagination(await this.deptService.listAllWithOperators(query.keyword?.trim()))
   }
 
   @ApiOperation({ summary: '导出部门 Excel（v1）', description: '与列表同筛选条件（keyword），带「完整路径」列，便于组织架构留档；需 system:dept:export' })
@@ -61,26 +59,35 @@ export class DeptV1Controller {
         { header: '部门名称', width: 22 },
         { header: '完整路径', width: 40 },
         { header: '机构编码', width: 16, align: 'center' },
+        { header: '英文名', width: 22 },
+        { header: '英文简写', width: 16 },
         { header: '部门负责人', width: 16 },
-        { header: '联系电话', width: 16 },
         { header: '排序', width: 8, align: 'center' },
         { header: '状态', width: 10, align: 'center' },
+        { header: '创建人', width: 16, align: 'center' },
+        { header: '更新人', width: 16, align: 'center' },
         { header: '创建时间', width: 20, align: 'center' }
       ],
       depts.map(dept => [
         dept.departName,
         dept.fullPath,
         dept.orgCode ?? '',
+        dept.departNameEn ?? '',
+        dept.departNameAbbr ?? '',
         dept.description ?? '',
-        dept.mobile ?? '',
         dept.departOrder ?? 0,
         dept.status === '0' ? '停用' : '正常',
+        dept.createByName ?? '',
+        dept.updateByName ?? '',
         formatDateTime(dept.createTime)
       ]),
       {
         title: '部门列表',
         subtitle: `导出时间：${formatDateTime(new Date())} · 操作人：${req.user?.username ?? '未知'} · 共 ${depts.length} 个部门${query.keyword ? ` · 筛选：关键字=${query.keyword}` : ''}`,
-        notes: ['说明：「完整路径」为该部门从顶级到自身的层级链路；机构编码由系统按父子关系生成，导入用户时按部门名称匹配。']
+        notes: [
+          '说明：「完整路径」为该部门从顶级到自身的层级链路；机构编码由系统按父子关系生成，导入用户时按部门名称匹配。',
+          '「创建人 / 更新人」显示用户真实姓名（未填姓名则显示登录账号），与部门列表一致。'
+        ]
       }
     )
     setDownloadHeaders(res, `depts-${Date.now()}.xlsx`, `部门列表-${formatDateTime(new Date()).slice(0, 10)}.xlsx`)

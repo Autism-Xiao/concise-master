@@ -6,6 +6,7 @@ import { BaseService } from '../../../helper/crud/base.service'
 import { BizErrorCode } from '../../../common/enums/biz-error-code.enum'
 import { BizException } from '../../../common/exceptions/biz.exception'
 import { applyTenantScope, tenantWriteCondition } from '../../../shared/tenant/tenant-scope.util'
+import { TenantContext } from '../../../shared/tenant/tenant.context'
 import { normalizeBatchIds, runBatchDelete, type BatchDeleteResult } from '../../../helper/crud/batch-delete'
 import { UserEntity } from '../../user/entities/user.entity'
 import { DeptEntity } from './entities/dept.entity'
@@ -15,6 +16,14 @@ import { queryRaw } from '../../../shared/database/raw-query'
 
 export interface DeptTreeItem extends DeptEntity {
   children: DeptTreeItem[]
+}
+
+/** 列表展示用：在部门实体上附带审计人姓名（库里仍只存 sys_user.id） */
+export interface DeptWithOperators extends DeptEntity {
+  /** 创建人姓名：realname 为空回退 username；历史账号名原样返回；已删用户显示「已删除用户」 */
+  createByName?: string | null
+  /** 更新人姓名，规则同上 */
+  updateByName?: string | null
 }
 
 /** 顶级部门的 parent_id 约定（null 或空串均视为顶级） */
@@ -64,6 +73,7 @@ export class DeptService extends BaseService<DeptEntity> {
       status: dto.status ?? '1',
       delFlag: '0',
       orgCategory: dto.orgCategory ?? '2',
+      createBy: TenantContext.userId(),
       createTime: new Date()
     })
   }
@@ -95,6 +105,7 @@ export class DeptService extends BaseService<DeptEntity> {
       }
     }
     dto.updateTime = new Date()
+    if (dto.updateBy === undefined) dto.updateBy = TenantContext.userId()
     const updated = await super.update(id, dto)
     // 机构编码变了，把挂了该部门的用户 sys_user.org_code 一并刷新（上面存的是冗余值）
     if (updated.orgCode && updated.orgCode !== before.orgCode) {
@@ -154,8 +165,9 @@ export class DeptService extends BaseService<DeptEntity> {
    * 导出：在扁平列表上补「完整路径」（研发部 / 前端组），方便直接看懂层级
    * 路径用父链上溯拼接，带 20 层保护，异常脏数据不会死循环
    */
-  async exportDepts(keyword?: string): Promise<Array<DeptEntity & { fullPath: string }>> {
+  async exportDepts(keyword?: string): Promise<Array<DeptWithOperators & { fullPath: string }>> {
     const all = await this.listAll()
+    // 父链必须基于全量构建：keyword 只命中子部门时，父部门不在结果里也能拼出完整路径
     const byId = new Map(all.map(dept => [dept.id, dept]))
     const resolvePath = (dept: DeptEntity): string => {
       const names: string[] = []
@@ -169,7 +181,9 @@ export class DeptService extends BaseService<DeptEntity> {
       return names.join(' / ')
     }
     const filtered = keyword ? all.filter(dept => (dept.departName ?? '').includes(keyword)) : all
-    return filtered.map(dept => Object.assign(dept, { fullPath: resolvePath(dept) }))
+    const withPath = filtered.map(dept => Object.assign(dept, { fullPath: resolvePath(dept) }))
+    // 与列表同口径：创建人/更新人翻译成姓名，页面和导出看到的一致
+    return this.attachOperatorNames(withPath)
   }
 
   /** 全量部门（按 depart_order 升序，排除已删除） */
@@ -177,6 +191,45 @@ export class DeptService extends BaseService<DeptEntity> {
     const qb = this.repository.createQueryBuilder('d').where('d.delFlag = :delFlag', { delFlag: '0' })
     applyTenantScope(qb, 'd')
     return qb.orderBy('d.departOrder', 'ASC').addOrderBy('d.id', 'ASC').getMany()
+  }
+
+  /**
+   * 部门全量列表 + 创建人/更新人姓名
+   *
+   * create_by/update_by 存的是 sys_user.id（owner 数据权限依赖它），直接展示是一串 32 位 ID。
+   * 这里一次性 IN 查询把 ID 翻译成「真实姓名（为空回退登录账号）」，只在接口层富化，不动库表。
+   */
+  async listAllWithOperators(keyword?: string): Promise<DeptWithOperators[]> {
+    const all = await this.listAll()
+    const filtered = keyword ? all.filter(dept => (dept.departName ?? '').includes(keyword)) : all
+    return this.attachOperatorNames(filtered)
+  }
+
+  /** 把 create_by/update_by（sys_user.id）批量翻译成展示姓名；列表与导出共用同一口径 */
+  private async attachOperatorNames<T extends DeptEntity>(depts: T[]): Promise<Array<T & Pick<DeptWithOperators, 'createByName' | 'updateByName'>>> {
+    const ids = [...new Set(depts.flatMap(dept => [dept.createBy, dept.updateBy].filter((v): v is string => !!v)))]
+    const names = new Map<string, string>()
+    if (ids.length) {
+      const users = await this.repository.manager
+        .createQueryBuilder(UserEntity, 'user')
+        .select(['user.id', 'user.realname', 'user.username'])
+        .where('user.id IN (:...ids)', { ids })
+        .getMany()
+      for (const user of users) names.set(user.id, user.realname || user.username)
+    }
+    const display = (raw?: string | null): string | null => {
+      if (!raw) return null
+      const name = names.get(raw)
+      if (name) return name
+      // 32 位 hex 是系统生成的 ID：查不到说明用户已删，别把裸 ID 甩给页面
+      return /^[0-9a-f]{32}$/i.test(raw) ? '已删除用户' : raw
+    }
+    return depts.map(dept => ({
+      // oxlint-disable-next-line typescript(no-misused-spread)
+      ...dept,
+      createByName: display(dept.createBy),
+      updateByName: display(dept.updateBy)
+    }))
   }
 
   /** 扁平列表转树（parent_id 为 null/'' 视为顶级） */

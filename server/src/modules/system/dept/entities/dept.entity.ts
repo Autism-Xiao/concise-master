@@ -39,33 +39,13 @@ export class DeptEntity {
   @Column({ length: 500, nullable: true, comment: '描述' })
   description?: string
 
-  @ApiPropertyOptional({ description: '机构类别：1 公司 / 2 部门 / 3 岗位 / 4 子公司', example: '2', nullable: true })
-  @Column({ length: 10, default: '1', comment: '机构类别 1公司，2部门，3岗位，4子公司' })
+  @ApiPropertyOptional({ description: '机构类别：1 公司 / 2 部门 / 4 子公司', example: '2', nullable: true })
+  @Column({ length: 10, default: '1', comment: '机构类别 1公司，2部门，4子公司（岗位走独立 sys_post 表）' })
   orgCategory?: string
-
-  @ApiPropertyOptional({ description: '树深度层级', example: '1', nullable: true })
-  @Column({ length: 10, nullable: true, comment: '树深度层级level' })
-  orgType?: string
 
   @ApiProperty({ description: '机构编码（同一租户内唯一，空则自动生成，如 A01 / A01A01）', example: 'A01' })
   @Column({ length: 64, comment: '机构编码（唯一性由联合键 (tenant_id, org_code) 保证）' })
   orgCode: string
-
-  @ApiPropertyOptional({ description: '手机号', example: '13800138000', nullable: true })
-  @Column({ length: 32, nullable: true, comment: '手机号' })
-  mobile?: string
-
-  @ApiPropertyOptional({ description: '传真', nullable: true })
-  @Column({ length: 32, nullable: true, comment: '传真' })
-  fax?: string
-
-  @ApiPropertyOptional({ description: '地址', nullable: true })
-  @Column({ length: 100, nullable: true, comment: '地址' })
-  address?: string
-
-  @ApiPropertyOptional({ description: '备注', nullable: true })
-  @Column({ length: 500, nullable: true, comment: '备注' })
-  memo?: string
 
   @ApiPropertyOptional({ description: '状态：1 启用 / 0 不启用', example: '1', nullable: true })
   @Column({ length: 1, default: '1', comment: '状态（1启用，0不启用）' })
@@ -94,10 +74,6 @@ export class DeptEntity {
   @ApiPropertyOptional({ description: '租户 ID（默认 0）', example: 0, nullable: true })
   @Column({ type: 'int', default: 0, comment: '租户ID' })
   tenantId?: number
-
-  @ApiPropertyOptional({ description: '是否有叶子节点：1 是 / 0 否', example: 0, nullable: true })
-  @Column({ type: 'smallint', default: 0, comment: '是否有叶子节点: 1是0否' })
-  izLeaf?: number
 
   /** 反向关系：仅用于 TypeORM 关系映射，不参与 JSON 序列化场景（不加载即不出现） */
   @ManyToMany(() => UserEntity, user => user.depts)

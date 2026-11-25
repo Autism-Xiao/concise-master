@@ -22,6 +22,12 @@ type DeptNode = TreeNode<Dept>
 
 type DropMode = 'before' | 'into' | 'after'
 
+/** 「创建 / 更新时间」列：带年份、精确到分钟；完整秒级时间放 title 悬浮可见 */
+function minuteTime(value?: string | null): string {
+  const full = formatDateTime(value)
+  return full === '-' ? '-' : full.slice(0, 16)
+}
+
 export function DeptPage() {
   const [list, setList] = useState<Dept[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -238,7 +244,7 @@ export function DeptPage() {
     }
     walk(roots, null)
 
-    // 只提交 parentId / departOrder 发生变化的节点（换父由后端防环并同步 orgCode）
+    // 只提交 parentId / departOrder 发生变化的节点（换父由后端防环，编码随节点原值保留）
     const changed = next.filter(n => {
       const old = depts.find(d => d.id === n.id)
       return old && (old.parentId !== n.parentId || old.departOrder !== n.departOrder)
@@ -249,7 +255,8 @@ export function DeptPage() {
     setSaving(true)
     withOperationLog('部门结构已调整', () =>
       Promise.all(
-        changed.map(n => updateDept(n.id, { departName: n.departName, parentId: n.parentId, departOrder: n.departOrder, description: n.description ?? null }))
+        // 带上 orgCode：换父级时后端只在没传编码时才自动重算，保留手编编码（如 TECH / TECH_FE）
+        changed.map(n => updateDept(n.id, { departName: n.departName, parentId: n.parentId, departOrder: n.departOrder, orgCode: n.orgCode ?? null, description: n.description ?? null }))
       )
     )
       .then(() => toast.success('部门结构已调整'))
@@ -341,15 +348,25 @@ export function DeptPage() {
           <TableCell className="text-muted-foreground max-w-24 truncate text-xs" title={node.description ?? undefined}>
             {node.description ?? '-'}
           </TableCell>
-          <TableCell className="text-muted-foreground text-xs">
-            <div className="whitespace-nowrap tabular-nums">
+          <TableCell
+            className="text-muted-foreground max-w-28 truncate text-xs"
+            title={`${node.createByName ?? '-'} / ${node.updateByName ?? '-'}`}
+          >
+            <div className="whitespace-nowrap">
               <span className="text-muted-foreground/70 me-1">建</span>
-              {formatDateTime(node.createTime)}
+              {node.createByName ?? '-'}
             </div>
-            <div className="whitespace-nowrap tabular-nums">
+            <div className="whitespace-nowrap">
               <span className="text-muted-foreground/70 me-1">更</span>
-              {formatDateTime(node.updateTime)}
+              {node.updateByName ?? '-'}
             </div>
+          </TableCell>
+          <TableCell
+            className="text-muted-foreground text-xs"
+            title={`${formatDateTime(node.createTime)} / ${formatDateTime(node.updateTime)}`}
+          >
+            <div className="whitespace-nowrap tabular-nums">{minuteTime(node.createTime)}</div>
+            <div className="whitespace-nowrap tabular-nums">{minuteTime(node.updateTime)}</div>
           </TableCell>
           {/* 纯图标 + title：三个按钮各带文字时操作列要占 176px，1280 屏会顶出横向滚动条 */}
           <TableCell className="table-sticky-action text-end whitespace-nowrap">
@@ -446,7 +463,7 @@ export function DeptPage() {
                   <Loader2 className="text-muted-foreground size-5 animate-spin" />
                 </div>
               )}
-              <Table containerClassName="h-full overflow-y-auto rounded-md border">
+              <Table containerClassName="h-full overflow-auto rounded-md border">
                 <TableHeader className="bg-card sticky top-0 z-10">
                   <TableRow>
                     <TableHead className="w-10">
@@ -469,7 +486,8 @@ export function DeptPage() {
                     <TableHead className="w-14">排序</TableHead>
                     <TableHead className="w-20">状态</TableHead>
                     <TableHead className="w-24">备注</TableHead>
-                    <TableHead className="w-36">创建 / 更新</TableHead>
+                    <TableHead className="w-24">创建人 / 更新人</TableHead>
+                    <TableHead className="w-36">创建 / 更新时间</TableHead>
                     <TableHead className="table-sticky-action w-28 text-end">操作</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -482,7 +500,7 @@ export function DeptPage() {
                       )
                     ) : (
                       <TableRow>
-                        <TableCell colSpan={10} className="text-muted-foreground py-10 text-center">
+                        <TableCell colSpan={11} className="text-muted-foreground py-10 text-center">
                           没有匹配的部门
                         </TableCell>
                       </TableRow>

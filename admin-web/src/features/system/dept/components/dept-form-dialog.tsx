@@ -22,6 +22,10 @@ interface DeptFormDialogProps {
 
 interface FormState {
   departName: string
+  /** 英文名（非必填） */
+  departNameEn: string
+  /** 英文简写（非必填） */
+  departNameAbbr: string
   /** null 表示顶级部门 */
   parentId: string | null
   /** 空串 = 新建时由后端自动生成 */
@@ -32,7 +36,17 @@ interface FormState {
   description: string
 }
 
-const emptyForm: FormState = { departName: '', parentId: null, orgCode: '', orgCategory: '2', departOrder: 0, status: '1', description: '' }
+const emptyForm: FormState = {
+  departName: '',
+  departNameEn: '',
+  departNameAbbr: '',
+  parentId: null,
+  orgCode: '',
+  orgCategory: '2',
+  departOrder: 0,
+  status: '1',
+  description: ''
+}
 
 /** 单行单选组（原生 radio，横向排布） */
 function RadioLine<T extends string>({ value, options, onChange }: { value: T; options: Array<{ value: T; label: string }>; onChange: (v: T) => void }) {
@@ -51,11 +65,13 @@ function RadioLine<T extends string>({ value, options, onChange }: { value: T; o
 /** 由父组件按 key 控制重挂载，保证打开时表单初始化为对应部门 */
 export function DeptFormDialog({ open, onOpenChange, dept, parentId, depts, onSubmit }: DeptFormDialogProps) {
   /** 机构类型走字典 sys_org_category */
-  const orgCategoryItems = useDict('sys_org_category', { '1': '公司', '2': '部门', '3': '岗位', '4': '子公司' })
+  const orgCategoryItems = useDict('sys_org_category', { '1': '公司', '2': '部门', '4': '子公司' })
   const [form, setForm] = useState<FormState>(() =>
     dept
       ? {
           departName: dept.departName,
+          departNameEn: dept.departNameEn ?? '',
+          departNameAbbr: dept.departNameAbbr ?? '',
           parentId: dept.parentId,
           orgCode: dept.orgCode ?? '',
           orgCategory: dept.orgCategory ?? '2',
@@ -82,6 +98,8 @@ export function DeptFormDialog({ open, onOpenChange, dept, parentId, depts, onSu
       !runValidation(
         {
           departName: [requiredWith('部门名称', maxLength(100, '部门名称'))],
+          departNameEn: [optional(maxLength(500, '英文名'))],
+          departNameAbbr: [optional(maxLength(500, '英文简写'))],
           orgCode: [optional(sysCode, maxLength(64, '部门编码'))],
           departOrder: [intRange(0, 9999, '排序号')]
         },
@@ -91,6 +109,8 @@ export function DeptFormDialog({ open, onOpenChange, dept, parentId, depts, onSu
       return
     onSubmit({
       departName: form.departName.trim(),
+      departNameEn: form.departNameEn.trim() || null,
+      departNameAbbr: form.departNameAbbr.trim() || null,
       parentId: form.parentId,
       orgCode: form.orgCode.trim() || null,
       orgCategory: form.orgCategory,
@@ -132,6 +152,31 @@ export function DeptFormDialog({ open, onOpenChange, dept, parentId, depts, onSu
             aria-invalid={!!errors.orgCode}
           />
           <FieldError message={errors.orgCode} />
+        </div>
+
+        <div className={field}>
+          <Label htmlFor="dept-name-en">英文名（选填）</Label>
+          <Input
+            id="dept-name-en"
+            value={form.departNameEn}
+            onChange={e => set('departNameEn', e.target.value)}
+            placeholder="如 R&D Department"
+            maxLength={500}
+            aria-invalid={!!errors.departNameEn}
+          />
+          <FieldError message={errors.departNameEn} />
+        </div>
+        <div className={field}>
+          <Label htmlFor="dept-name-abbr">英文简写（选填）</Label>
+          <Input
+            id="dept-name-abbr"
+            value={form.departNameAbbr}
+            onChange={e => set('departNameAbbr', e.target.value)}
+            placeholder="如 RD"
+            maxLength={500}
+            aria-invalid={!!errors.departNameAbbr}
+          />
+          <FieldError message={errors.departNameAbbr} />
         </div>
 
         <div className={field}>
