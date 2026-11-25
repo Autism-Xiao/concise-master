@@ -31,6 +31,7 @@ import { QueryPostDto } from './dto/query-post.dto'
 import { UpdatePostDto } from './dto/update-post.dto'
 import { PostEntity } from './entities/post.entity'
 import { PostService } from './post.service'
+import { UserService } from '../../user/user.service'
 
 /** 状态着色：正常绿、停用灰 */
 const STATUS_STYLE = { 1: { fontColor: 'FF0F766E', fillColor: 'FFE7F7F0' }, 0: { fontColor: 'FF6B7280', fillColor: 'FFF3F4F6' } }
@@ -44,7 +45,10 @@ const STATUS_STYLE = { 1: { fontColor: 'FF0F766E', fillColor: 'FFE7F7F0' }, 0: {
 @ApiBearerAuth('jwt')
 @Controller('v1/posts')
 export class PostV1Controller {
-  constructor(private readonly postService: PostService) {}
+  constructor(
+    private readonly postService: PostService,
+    private readonly userService: UserService
+  ) {}
 
   @ApiOperation({ summary: '岗位列表（v1）', description: 'post_sort 升序，带所属部门；keyword 模糊匹配名称/编码/描述；支持 deptId 过滤；需 system:post:list' })
   @ApiOkResponse({ description: '岗位列表（统一分页结构；size = total，一次全量返回）', type: Pagination })
@@ -194,5 +198,26 @@ export class PostV1Controller {
   @Delete(':id')
   delete(@Param('id') id: string) {
     return this.postService.delete(id)
+  }
+
+  @ApiOperation({
+    summary: '配置岗位默认角色（v1，全量覆盖）',
+    description:
+      '写入 sys_position_role；admin 角色不可配置；保存后自动为所有持有该岗位的用户重算「岗位来源」角色（sys_user_role.source=position，手动分配的 manual 绑定不受影响）'
+  })
+  @OperLog('岗位管理')
+  @Perms('system:post:update')
+  @Put(':id/roles')
+  async assignPositionRoles(@Param('id') id: string, @Body() dto: { roleIds: string[] }) {
+    const roleIds = await this.postService.assignPositionRoles(id, dto.roleIds ?? [])
+    const syncedUsers = await this.userService.syncPositionRolesForPost(id)
+    return { roleIds, syncedUsers }
+  }
+
+  @ApiOperation({ summary: '读取岗位默认角色（v1）', description: '返回岗位模板绑定的角色 id 集合（配置回显用）' })
+  @Perms('system:post:list')
+  @Get(':id/roles')
+  async listPositionRoles(@Param('id') id: string) {
+    return { roleIds: await this.postService.listPositionRoleIds(id) }
   }
 }

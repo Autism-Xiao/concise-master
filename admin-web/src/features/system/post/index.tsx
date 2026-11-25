@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Download, Pencil, Plus, Search, Trash2, Upload } from 'lucide-react'
+import { Download, Network, Pencil, Plus, Search, Trash2, Upload } from 'lucide-react'
 import { toast } from 'sonner'
 import { toastError } from '@/lib/toast-error'
 import type { ColumnDef } from '@tanstack/react-table'
@@ -17,6 +17,7 @@ import { hasPermission } from '@/lib/auth'
 import { toastBatchResult } from '@/lib/batch-delete'
 import { saveBlobFile } from '@/lib/download'
 import { PostFormDialog } from './components/post-form-dialog'
+import { PostRoleDialog } from './components/post-role-dialog'
 import {
   createPost,
   deletePost,
@@ -49,6 +50,7 @@ export function PostPage() {
   const [statusFilter, setStatusFilter] = useState('all')
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<Post | null>(null)
+  const [roleTarget, setRoleTarget] = useState<Post | null>(null)
   const [deleting, setDeleting] = useState<Post | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const [exporting, setExporting] = useState(false)
@@ -138,6 +140,12 @@ export function PostPage() {
               <Button variant="ghost" size="icon" onClick={() => openEdit(row.original)}>
                 <Pencil className="size-4" />
                 <span className="sr-only">编辑</span>
+              </Button>
+            )}
+            {hasPermission('system:post:update') && (
+              <Button variant="ghost" size="icon" onClick={() => setRoleTarget(row.original)} title="默认角色">
+                <Network className="size-4" />
+                <span className="sr-only">默认角色</span>
               </Button>
             )}
             {hasPermission('system:post:delete') && (
@@ -294,6 +302,10 @@ export function PostPage() {
       )}
 
       {formOpen && <PostFormDialog key={editing?.id ?? 'new'} open={formOpen} onOpenChange={setFormOpen} post={editing} onSubmit={handleSubmit} />}
+
+      {roleTarget && (
+        <PostRoleDialog key={roleTarget.id} open={!!roleTarget} onOpenChange={v => !v && setRoleTarget(null)} post={roleTarget} onSaved={() => undefined} />
+      )}
 
       {importOpen && (
         <ExcelImportDialog

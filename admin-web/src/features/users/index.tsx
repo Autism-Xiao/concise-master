@@ -189,8 +189,8 @@ export function UsersPage() {
         setDeleting,
         superviseDeptEnabled
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- 列定义引用的是渲染期调用的 handler（闭包取最新值），不需要随函数标识重建
-    []
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- handler 均为渲染期闭包取最新值；superviseDeptEnabled 是普通值，特性开关异步拉到后必须重建列，否则入口永远隐藏
+    [superviseDeptEnabled]
   )
 
   const statusItems = useMemo(() => ({ all: '全部状态', ...Object.fromEntries(Object.entries(userStatusMap).map(([value, { label }]) => [value, label])) }), [])

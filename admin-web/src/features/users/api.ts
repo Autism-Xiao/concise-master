@@ -32,6 +32,8 @@ export interface User {
   /** 回收站行用：软删时间（update_time） */
   updateTime?: string
   roles?: Pick<Role, 'id' | 'roleName' | 'roleCode'>[]
+  /** 角色绑定来源（详情接口带出）：roleId → 'manual'（手动分配）/ 'position'（岗位模板带入）；岗位带入的不可在表单取消 */
+  roleSources?: Record<string, string>
   depts?: Array<{ id: string; departName: string }>
   /** 岗位列表（sys_user_post） */
   posts?: Array<{ id: string; postName?: string; postCode?: string }>
@@ -275,6 +277,13 @@ export function updateMyProfile(payload: MyProfilePatch): Promise<User> {
 
 export { fetchRoleOptions }
 export type { Role }
+
+/* ---------- 用户详情（编辑表单用） ---------- */
+
+/** 用户详情（含 roleSources：角色绑定来源，岗位模板带入的角色在表单里锁死不可取消） */
+export function fetchUserDetail(id: string): Promise<User> {
+  return getApiResult<User>(`/backend-api/v1/users/${id}`)
+}
 
 /* ---------- 管辖部门（ReBAC 监管数据权限） ---------- */
 

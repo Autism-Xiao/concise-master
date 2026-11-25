@@ -86,3 +86,22 @@ export function importPosts(file: File): Promise<ImportResult> {
 export function deletePosts(ids: string[]): Promise<BatchDeleteResult> {
   return batchDeleteRequest('posts', ids)
 }
+
+/* ---------- 岗位默认角色模板（岗位 → 角色模板） ---------- */
+
+/** 读取岗位默认角色 id 集合（配置回显） */
+export function fetchPositionRoleIds(postId: string): Promise<string[]> {
+  return getApiResult<{ roleIds: string[] }>(`/backend-api/v1/posts/${postId}/roles`).then(res => res.roleIds ?? [])
+}
+
+/**
+ * 配置岗位默认角色（全量覆盖）。
+ * 后端保存后自动为所有持有该岗位的用户重算「岗位来源」角色，返回受影响用户数。
+ */
+export function assignPositionRoles(postId: string, roleIds: string[]): Promise<{ roleIds: string[]; syncedUsers: number }> {
+  return getApiResult<{ roleIds: string[]; syncedUsers: number }>(`/backend-api/v1/posts/${postId}/roles`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roleIds })
+  })
+}

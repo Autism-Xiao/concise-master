@@ -78,7 +78,7 @@ export function applyOwnerScope<T extends ObjectLiteral>(
     // 子查询从 owner（sys_user.id）反查 sys_user_depart，业务表无需 dept_id 列。
     // 去重靠 EXISTS 天然实现（同一用户属于多个监管部门也只出一行）。
     qb.andWhere(
-      `(${alias}.${ownerColumn} = :__ownerScopeId OR EXISTS (SELECT 1 FROM \`sys_user_depart\` __osd WHERE __osd.\`user_id\` = ${alias}.${ownerColumn} AND __osd.\`dep_id\` IN (:...__ownerScopeDeptIds)))`,
+      `(${alias}.${ownerColumn} = :__ownerScopeId OR EXISTS (SELECT 1 FROM sys_user_depart __osd WHERE __osd.user_id = ${alias}.${ownerColumn} AND __osd.dep_id IN (:...__ownerScopeDeptIds)))`,
       { __ownerScopeId: current.id, __ownerScopeDeptIds: deptIds }
     )
     return

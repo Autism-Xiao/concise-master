@@ -4,7 +4,7 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AppDrawer } from '@/components/app-drawer'
-import { fetchBackendDepts, fetchRoleOptions, type Role, type User, type UserWritePayload } from '../api'
+import { fetchBackendDepts, fetchRoleOptions, fetchUserDetail, type Role, type User, type UserWritePayload } from '../api'
 import { fetchPosts, type Post } from '@/features/system/post/api'
 import { fetchLevels, type Level } from '@/features/system/level/api'
 import { useDict } from '@/lib/dict'
@@ -56,13 +56,13 @@ const emptyForm: FormState = {
   mustChangePassword: 0
 }
 
-/** 复选框列表（角色/部门多选）；disabled 项不可新勾选（已选中的允许取消，便于摘除） */
+/** 复选框列表（角色/部门多选）；disabled 项不可新勾选（已选中的允许取消，便于摘除）；locked 项完全锁死（岗位模板带入的角色，去留由岗位决定） */
 function CheckList({
   options,
   selected,
   onToggle
 }: {
-  options: Array<{ id: string; label: string; disabled?: boolean }>
+  options: Array<{ id: string; label: string; disabled?: boolean; locked?: boolean }>
   selected: string[]
   onToggle: (id: string) => void
 }) {
@@ -70,7 +70,7 @@ function CheckList({
   return (
     <div className="max-h-44 space-y-1.5 overflow-y-auto rounded-md border p-2">
       {options.map(o => {
-        const locked = o.disabled === true && !selected.includes(o.id)
+        const locked = o.locked === true || (o.disabled === true && !selected.includes(o.id))
         return (
           <label key={o.id} className={`flex items-center gap-2 rounded px-1 py-0.5 text-sm ${locked ? 'opacity-60' : 'hover:bg-accent cursor-pointer'}`}>
             <input type="checkbox" className="accent-primary" checked={selected.includes(o.id)} disabled={locked} onChange={() => onToggle(o.id)} />
@@ -107,6 +107,8 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
       : { ...emptyForm, deptIds: defaultDeptIds ?? [] }
   )
   const [roles, setRoles] = useState<Role[] | null>(null)
+  /** 角色绑定来源（编辑时拉详情带出）：岗位模板带入的角色锁死，去留由岗位决定 */
+  const [roleSources, setRoleSources] = useState<Record<string, string> | null>(null)
   const [depts, setDepts] = useState<Array<{ id: string; departName: string; status?: string }> | null>(null)
   const [posts, setPosts] = useState<Post[] | null>(null)
   const [levels, setLevels] = useState<Level[] | null>(null)
@@ -126,6 +128,14 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
       })
       .catch(e => setLoadError(e instanceof Error ? e.message : '加载角色/部门失败'))
   }, [])
+
+  // 编辑已有用户时补拉详情：列表行不带 roleSources（关联表附加列），需要单独取
+  useEffect(() => {
+    if (!user?.id) return
+    fetchUserDetail(user.id)
+      .then(d => setRoleSources(d.roleSources ?? {}))
+      .catch(() => setRoleSources(null))
+  }, [user?.id])
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm(prev => ({ ...prev, [key]: value }))
@@ -298,10 +308,19 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
             <div className="space-y-2">
               <Label>角色（多选）</Label>
               <CheckList
-                options={roles.map(r => ({ id: r.id, label: r.roleName || r.roleCode }))}
+                options={roles.map(r => {
+                  // 岗位模板带入的角色锁死：勾选状态由岗位决定，取消要去岗位管理改模板或调整用户岗位
+                  const fromPost = roleSources?.[r.id] === 'position'
+                  return {
+                    id: r.id,
+                    label: fromPost ? `${r.roleName || r.roleCode}（岗位带入）` : r.roleName || r.roleCode,
+                    locked: fromPost
+                  }
+                })}
                 selected={form.roleIds}
                 onToggle={id => toggle('roleIds', id)}
               />
+              <p className="text-muted-foreground text-xs">标注「岗位带入」的角色来自岗位默认角色模板，不可在此取消。</p>
             </div>
             <div className="space-y-2">
               <Label>部门（多选，首个为主部门）</Label>

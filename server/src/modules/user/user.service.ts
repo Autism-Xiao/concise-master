@@ -358,7 +358,12 @@ export class UserService extends BaseService<UserEntity> {
     return this.findOneDetail(id) as Promise<UserEntity>
   }
 
-  /** 绑定角色（全量覆盖：多退少补）；只能分配本租户的角色 */
+  /**
+   * 绑定角色（手动来源，全量覆盖：多退少补）
+   * - 只增删 source='manual' 的绑定行；岗位模板带入的（source='position'）由 syncPositionRoles 管理
+   * - 提交里混入的岗位来源角色 id 会被忽略（界面上它们是只读标注项）
+   * - 只能分配本租户的角色
+   */
   async assignRoles(id: string, roleIds: string[], manager?: EntityManager): Promise<void> {
     // 独立接口直接调用时校验用户存在；事务内调用时由调用方（create/update）负责校验
     if (!manager) {
@@ -389,21 +394,28 @@ export class UserService extends BaseService<UserEntity> {
       }
     }
 
-    // 用显式 SQL 而不是 relation API：关联表要写 tenant_id（记的是角色归属租户），
-    // relation API 只能写两列，让它留默认值 0 的话这张表就永远查不出真实归属。
+    // 用显式 SQL 而不是 relation API：关联表要写 tenant_id（记的是角色归属租户）与 source（绑定来源），
+    // relation API 只能写两列，让它留默认值的话这张表就永远查不出真实归属。
     //
-    // 「全量覆盖」只能覆盖**当前租户视角内**的绑定：currentRows 若取该用户在所有租户的
+    // 本方法只管理 **手动分配（source='manual'）** 的绑定：岗位模板带入的（source='position'）
+    // 由 syncPositionRoles 统一增删，手动提交的角色列表不会误删它们。
+    // 「全量覆盖」只覆盖**当前租户视角内**的绑定：currentRows 若取该用户在所有租户的
     // 角色，A 租户管理员把自己的角色列表提交上来，就会把此人在 B 租户的角色一并删掉
     // （B 租户的管理员/编辑器权限凭空消失）。平台视角（null）才保留全租户语义，用于运维。
     const roleScope = TenantContext.filterTenantId()
     const scopeSql = tenantWriteSql(roleScope)
-    const currentRows = await queryRaw<Array<{ role_id: string }>>(em, `SELECT role_id FROM sys_user_role WHERE user_id = ?${scopeSql.clause}`, [
-      id,
-      ...scopeSql.params
-    ])
-    const currentIds = new Set(currentRows.map(row => row.role_id))
-    const toRemove = [...currentIds].filter(roleId => !ids.includes(roleId))
-    const toAdd = roles.filter(role => !currentIds.has(role.id))
+    const currentRows = await queryRaw<Array<{ role_id: string; source: string }>>(
+      em,
+      `SELECT role_id, source FROM sys_user_role WHERE user_id = ?${scopeSql.clause}`,
+      [id, ...scopeSql.params]
+    )
+    const positionBound = new Set(currentRows.filter(row => row.source === 'position').map(row => row.role_id))
+    const manualCurrentIds = currentRows.filter(row => row.source === 'manual').map(row => row.role_id)
+    const allCurrentIds = new Set(currentRows.map(row => row.role_id))
+    // 岗位来源的角色在界面上是只读的（带「岗位」标注），提交里混入的这类 id 直接忽略
+    const manualTargetIds = ids.filter(roleId => !positionBound.has(roleId))
+    const toRemove = manualCurrentIds.filter(roleId => !manualTargetIds.includes(roleId))
+    const toAdd = roles.filter(role => manualTargetIds.includes(role.id) && !allCurrentIds.has(role.id))
 
     if (toRemove.length) {
       // 兜底：不能解绑某租户最后一个 admin 角色，否则该租户再无人能管
@@ -424,21 +436,20 @@ export class UserService extends BaseService<UserEntity> {
         }
       }
       const placeholders = toRemove.map(() => '?').join(',')
-      // 删除条件与上面的读取范围一致：租户视角只解绑本租户的角色行，
-      // 共享角色（tenant_id=0）和其它租户的绑定都不动。
-      await queryRaw(em, `DELETE FROM sys_user_role WHERE user_id = ?${scopeSql.clause} AND role_id IN (${placeholders})`, [
-        id,
-        ...scopeSql.params,
-        ...toRemove
-      ])
+      // 删除条件与上面的读取范围一致：租户视角只解绑本租户的手动绑定行，
+      // 共享角色（tenant_id=0）、其它租户的绑定与岗位来源行都不动。
+      await queryRaw(
+        em,
+        `DELETE FROM sys_user_role WHERE user_id = ?${scopeSql.clause} AND source = 'manual' AND role_id IN (${placeholders})`,
+        [id, ...scopeSql.params, ...toRemove]
+      )
     }
     for (const role of toAdd) {
-      await queryRaw(em, `${sqlInsertIgnorePrefix()} sys_user_role (id, user_id, role_id, tenant_id) VALUES (?, ?, ?, ?)${sqlInsertIgnoreSuffix()}`, [
-        randomId32(),
-        id,
-        role.id,
-        Number(role.tenantId ?? 0)
-      ])
+      await queryRaw(
+        em,
+        `${sqlInsertIgnorePrefix()} sys_user_role (id, user_id, role_id, tenant_id, source) VALUES (?, ?, ?, ?, 'manual')${sqlInsertIgnoreSuffix()}`,
+        [randomId32(), id, role.id, Number(role.tenantId ?? 0)]
+      )
     }
     // 重新派生 is_tenant_admin 标志位（兜底防锁死 + 前端标注）
     await this.syncTenantAdminFlag(id, em)
@@ -662,6 +673,66 @@ export class UserService extends BaseService<UserEntity> {
     if (toAdd.length || toRemove.length) {
       await repo.createQueryBuilder().relation(UserEntity, 'posts').of(id).addAndRemove(toAdd, toRemove)
     }
+    // 岗位变了，岗位模板带入的角色随之增删（幂等；事务内调用时与挂岗同生共死）。
+    // 挂岗后即使岗位集合没变也跑一遍：模板可能刚被改过而持有者还没重算过。
+    await this.syncPositionRoles(id, manager)
+  }
+
+  /**
+   * 按岗位模板同步「岗位来源」的角色绑定（sys_user_role.source='position'）。
+   *
+   * 目标集合 = 用户当前所有岗位的默认角色并集（sys_position_role）：
+   * - 目标里有、当前没绑 → 插入 position 来源行（tenant 记角色归属租户）
+   * - 目标里没有、当前是 position 来源 → 删除（调岗/模板收紧时自动回收）
+   * - manual 来源行永不增删：管理员手动分配不受模板影响
+   * - 同一 (user_id, role_id) 只留一行：任何来源已存在时跳过插入，避免
+   *   ManyToMany 关系查询因重复行返回重复角色
+   */
+  async syncPositionRoles(userId: string, manager?: EntityManager): Promise<void> {
+    const em = manager ?? this.repository.manager
+    const desiredRows = await queryRaw<Array<{ role_id: string }>>(
+      em,
+      // JOIN sys_position：岗位被硬删后 sys_user_post 可能残留孤儿行（历史行为），
+      // 不排除会把已删岗位的模板角色继续带给持有者
+      'SELECT DISTINCT pr.role_id FROM sys_position_role pr JOIN sys_user_post up ON up.post_id = pr.position_id JOIN sys_position p ON p.id = pr.position_id WHERE up.user_id = ?',
+      [userId]
+    )
+    const desired = new Set(desiredRows.map(row => row.role_id))
+    const currentRows = await queryRaw<Array<{ role_id: string; source: string }>>(em, 'SELECT role_id, source FROM sys_user_role WHERE user_id = ?', [
+      userId
+    ])
+    const allBound = new Set(currentRows.map(row => row.role_id))
+    const toRemove = currentRows.filter(row => row.source === 'position' && !desired.has(row.role_id)).map(row => row.role_id)
+    const toAddIds = [...desired].filter(roleId => !allBound.has(roleId))
+    if (!toRemove.length && !toAddIds.length) {
+      return
+    }
+    if (toRemove.length) {
+      const placeholders = toRemove.map(() => '?').join(',')
+      await queryRaw(em, `DELETE FROM sys_user_role WHERE user_id = ? AND source = 'position' AND role_id IN (${placeholders})`, [userId, ...toRemove])
+    }
+    if (toAddIds.length) {
+      // 模板配置入口已挡掉跨租户与 admin 角色；这里对已被删除的角色静默跳过（模板里残留死 id 不阻断挂岗）
+      const roles = await em.getRepository(RoleEntity).findBy({ id: In(toAddIds) })
+      for (const role of roles) {
+        await queryRaw(
+          em,
+          `${sqlInsertIgnorePrefix()} sys_user_role (id, user_id, role_id, tenant_id, source) VALUES (?, ?, ?, ?, 'position')${sqlInsertIgnoreSuffix()}`,
+          [randomId32(), userId, role.id, Number(role.tenantId ?? 0)]
+        )
+      }
+    }
+    // 角色绑定变了，JwtStrategy 缓存的 roles 就过期了（RolesGuard 直接读它）
+    this.authUserCache.invalidate(userId)
+  }
+
+  /** 岗位模板变更后，为所有持有该岗位的用户重算岗位来源角色；返回受影响用户数 */
+  async syncPositionRolesForPost(postId: string): Promise<number> {
+    const rows = await queryRaw<Array<{ user_id: string }>>(this.repository.manager, 'SELECT user_id FROM sys_user_post WHERE post_id = ?', [postId])
+    for (const row of rows) {
+      await this.syncPositionRoles(row.user_id)
+    }
+    return rows.length
   }
 
   /** 事务内使用的用户仓库（不传 manager 时走默认连接） */
@@ -829,7 +900,7 @@ export class UserService extends BaseService<UserEntity> {
         : [])
     ]
     if (deptFilters.length) {
-      qb.andWhere('EXISTS (SELECT 1 FROM `sys_user_depart` ud WHERE ud.`user_id` = user.id AND ud.`dep_id` IN (:...deptFilters))', {
+      qb.andWhere('EXISTS (SELECT 1 FROM sys_user_depart ud WHERE ud.user_id = user.id AND ud.dep_id IN (:...deptFilters))', {
         deptFilters
       })
     }
@@ -912,7 +983,7 @@ export class UserService extends BaseService<UserEntity> {
       }
       deptIds = [...seen]
     }
-    qb.andWhere('EXISTS (SELECT 1 FROM `sys_user_depart` ud2 WHERE ud2.`user_id` = user.id AND ud2.`dep_id` IN (:...scopeDeptIds))', {
+    qb.andWhere('EXISTS (SELECT 1 FROM sys_user_depart ud2 WHERE ud2.user_id = user.id AND ud2.dep_id IN (:...scopeDeptIds))', {
       scopeDeptIds: deptIds
     })
   }
@@ -1109,6 +1180,10 @@ export class UserService extends BaseService<UserEntity> {
     this.applyDepts(user)
     await this.attachLevel([user])
     await this.attachWatermark([user])
+    // 角色绑定来源（manual=手动 / position=岗位模板带入）：ManyToMany 关系带不出关联表附加列，
+    // 额外查一次；前端据此把岗位带入的角色标成只读（用户表单里不可取消勾选）
+    const roleRows = await queryRaw<Array<{ role_id: string; source: string }>>(this.repository.manager, 'SELECT role_id, source FROM sys_user_role WHERE user_id = ?', [id])
+    ;(user as UserEntity & { roleSources?: Record<string, string> }).roleSources = Object.fromEntries(roleRows.map(row => [row.role_id, row.source]))
     return user
   }
 

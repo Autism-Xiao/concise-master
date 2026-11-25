@@ -20,7 +20,10 @@ import {
   type ImportResult
 } from '../../../helper/import/excel-import'
 import { DeptEntity } from '../dept/entities/dept.entity'
+import { RoleEntity } from '../../role/entities/role.entity'
+import { PositionRoleEntity } from './entities/position-role.entity'
 import { PostEntity } from './entities/post.entity'
+import { randomId32 } from '../../../utils/password.util'
 import type { CreatePostDto } from './dto/create-post.dto'
 import type { QueryPostDto } from './dto/query-post.dto'
 import type { UpdatePostDto } from './dto/update-post.dto'
@@ -52,7 +55,9 @@ const POST_IMPORT_ALIASES: Record<PostImportField, string[]> = {
 export class PostService extends BaseService<PostEntity> {
   constructor(
     @InjectRepository(PostEntity)
-    private readonly postRepository: Repository<PostEntity>
+    private readonly postRepository: Repository<PostEntity>,
+    @InjectRepository(PositionRoleEntity)
+    private readonly positionRoleRepository: Repository<PositionRoleEntity>
   ) {
     super(postRepository, '岗位')
   }
@@ -121,7 +126,12 @@ export class PostService extends BaseService<PostEntity> {
 
   /** 所属部门必须存在且当前租户可见（跨租户的部门视为不存在） */
   private async assertDeptExists(deptId: string): Promise<void> {
-    const qb = this.postRepository.manager.createQueryBuilder(DeptEntity, 'dept').where('dept.id = :deptId', { deptId }).andWhere('dept.del_flag = 0')
+    // del_flag 是 varchar(1)，必须按字符串比较：MySQL 能隐式转换数字，PostgreSQL 会直接报
+    // "operator does not exist: character varying = integer"
+    const qb = this.postRepository.manager
+      .createQueryBuilder(DeptEntity, 'dept')
+      .where('dept.id = :deptId', { deptId })
+      .andWhere('dept.del_flag = :delFlag', { delFlag: '0' })
     applyTenantScope(qb, 'dept')
     const dept = await qb.getOne()
     if (!dept) {
@@ -153,7 +163,7 @@ export class PostService extends BaseService<PostEntity> {
     // 编码/部门都只在当前租户可见范围内匹配（本租户 ∪ 平台共享），跨租户数据不参与导入判定
     const existingQb = this.postRepository.createQueryBuilder('post')
     applyTenantScope(existingQb, 'post')
-    const deptsQb = this.postRepository.manager.createQueryBuilder(DeptEntity, 'dept').where('dept.del_flag = 0')
+    const deptsQb = this.postRepository.manager.createQueryBuilder(DeptEntity, 'dept').where('dept.del_flag = :delFlag', { delFlag: '0' })
     applyTenantScope(deptsQb, 'dept')
     const [existing, depts] = await Promise.all([existingQb.getMany(), deptsQb.getMany()])
     const byCode = new Map(existing.map(post => [post.postCode.trim().toLowerCase(), post]))
@@ -255,5 +265,67 @@ export class PostService extends BaseService<PostEntity> {
       },
       ids
     )
+  }
+
+  /** 删除岗位：先清默认角色模板行（硬删无钩子），持有者的岗位来源角色由下次挂岗同步自然回收 */
+  async delete(id: string): Promise<void> {
+    await this.positionRoleRepository.delete({ positionId: id })
+    await super.delete(id)
+  }
+
+  /* ---------- 岗位默认角色模板（岗位 → 角色模板） ---------- */
+
+  /** 岗位默认角色 id 列表（配置回显）；岗位不存在时统一 404 */
+  async listPositionRoleIds(postId: string): Promise<string[]> {
+    await this.findOne(postId)
+    const rows = await this.positionRoleRepository.find({ where: { positionId: postId } })
+    return rows.map(row => row.roleId)
+  }
+
+  /**
+   * 配置岗位默认角色（全量覆盖）。持有者的角色重算由控制器层调用
+   * UserService.syncPositionRolesForPost 完成（本服务不反向依赖用户模块）。
+   *
+   * 校验规则与用户分配角色同口径：
+   * - 角色必须存在，且不能是其它租户的角色（角色是租户级资产）
+   * - admin 角色不能进模板：租户管理员必须显式分配，避免挂岗自动放大权限
+   */
+  async assignPositionRoles(postId: string, roleIds: string[]): Promise<string[]> {
+    const post = await this.findOne(postId)
+    const ids = [...new Set(roleIds.filter(Boolean))]
+    const roles = ids.length ? await this.positionRoleRepository.manager.getRepository(RoleEntity).findBy({ id: In(ids) }) : []
+    if (roles.length !== ids.length) {
+      const found = new Set(roles.map(role => role.id))
+      throw new BadRequestException(`角色不存在：${ids.filter(roleId => !found.has(roleId)).join(',')}`)
+    }
+    const currentTenant = TenantContext.filterTenantId()
+    if (currentTenant !== null) {
+      const illegal = roles.filter(role => {
+        const owner = Number(role.tenantId ?? 0)
+        return owner !== 0 && owner !== currentTenant
+      })
+      if (illegal.length) {
+        throw new BadRequestException(`角色「${illegal.map(role => role.roleName ?? role.roleCode).join('、')}」不属于当前租户，不能配置`)
+      }
+    }
+    const adminRoles = roles.filter(role => role.roleCode === 'admin' && Number(role.tenantId ?? 0) > 0)
+    if (adminRoles.length) {
+      throw new BadRequestException('租户管理员角色不能配置为岗位默认角色，请显式分配给具体用户')
+    }
+    await this.positionRoleRepository.manager.transaction(async em => {
+      const repo = em.getRepository(PositionRoleEntity)
+      await repo.delete({ positionId: postId })
+      if (roles.length) {
+        await repo.insert(
+          roles.map(role => ({
+            id: randomId32(),
+            positionId: postId,
+            roleId: role.id,
+            tenantId: Number(post.tenantId ?? 0)
+          }))
+        )
+      }
+    })
+    return ids
   }
 }

@@ -13,10 +13,12 @@ build/
 !.env.docker.example
 
 # 日志与运行时数据
-logs/
-storage/
-public/upload/
-pids/
+# 注意：必须锚定到 /server/ 下。写成裸的 storage/ 会命中任意层级的同名目录，
+# 把 server/src/shared/storage、server/src/modules/tools/storage 这些源码一起忽略掉
+/server/logs/
+/server/storage/
+/server/public/upload/
+/server/pids/
 coverage/
 .nyc_output/
 
