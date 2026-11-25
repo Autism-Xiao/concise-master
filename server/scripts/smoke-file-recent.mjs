@@ -113,7 +113,7 @@ try {
     try {
       await api(`/v1/tenants/${id}`, { method: 'DELETE' })
     } catch {
-      // 清理失败不掩盖断言结果；软删残留由 cleanup-smoke-data.mjs 兜底
+      // 清理失败不掩盖断言结果；残留数据可手工清理
       console.warn(`清理租户 ${id} 失败（不影响本次断言）`)
     }
   }

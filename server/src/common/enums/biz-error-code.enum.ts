@@ -100,8 +100,6 @@ export enum BizErrorCode {
   IMPORT_HEADER_MISMATCH = 6103,
   /** 导入文件没有数据行（空文件 / 只有表头） —— 消费方：全部导入入口共用（assertImportRows + 各模块首行判空） */
   IMPORT_EMPTY = 6104,
-  /** CSV 编码不是 UTF-8 */
-  IMPORT_CSV_ENCODING = 6105,
   /** 物理文件丢失（存储目录被手动清理） */
   FILE_MISSING = 6106,
 

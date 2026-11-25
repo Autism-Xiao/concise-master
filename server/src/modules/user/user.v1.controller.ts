@@ -9,7 +9,7 @@ import { FeatureFlag } from '../../common/decorators/feature-flag.decorator'
 import { OperLog } from '../../common/decorators/oper-log.decorator'
 import { sendXlsx } from '../../helper/export/excel-export'
 import { readImportFile } from '../../helper/import/import-file'
-import { formatDateTime } from '../../utils/csv.util'
+import { formatDateTime } from '../../utils/date.util'
 import { setDownloadHeaders } from '../../utils/download.util'
 import { buildImportTemplateXlsx } from '../../utils/xlsx.util'
 import { BatchAssignRolesDto, BatchUserStatusDto, UpdateAvatarDto } from './dto/batch-user.dto'
@@ -146,13 +146,13 @@ export class UserV1Controller {
   @ApiOperation({
     summary: '导入用户 Excel（v1）',
     description:
-      'multipart/form-data，字段名 file；支持 .xlsx（推荐）与 .csv；按「登录账号」判定新增/更新；部门/角色按名称匹配，找不到则该行失败；单行失败不影响其他行'
+      'multipart/form-data，字段名 file；仅支持 .xlsx；按「登录账号」判定新增/更新；部门/角色按名称匹配，找不到则该行失败；单行失败不影响其他行'
   })
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {
       type: 'object',
-      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）；兼容 .csv（UTF-8）' } },
+      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）' } },
       required: ['file']
     }
   })

@@ -137,7 +137,7 @@ export function downloadRoleTemplate(): Promise<{ filename: string; blob: Blob }
   return downloadFromApi('/v1/roles/import-template', 'roles-import-template.xlsx')
 }
 
-/** 导入角色（multipart，字段名 file；支持 .xlsx/.csv，按角色编码新增或更新，不动菜单授权） */
+/** 导入角色（multipart，字段名 file；仅支持 .xlsx，按角色编码新增或更新，不动菜单授权） */
 export function importRoles(file: File): Promise<RoleImportResult> {
   const form = new FormData()
   form.append('file', file)

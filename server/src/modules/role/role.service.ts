@@ -391,7 +391,7 @@ export class RoleService extends BaseService<RoleEntity> {
   }
 
   /**
-   * 导入角色（入参为已解析的二维表格数据，xlsx/csv 由 controller 负责解析）
+   * 导入角色（入参为已解析的二维表格数据，xlsx 由 controller 负责解析）
    * - 新增：roleName/roleCode/description 入库，不绑定菜单权限
    * - 已存在：只覆盖 roleName/description（不传 description 则保持原值），已有授权不受影响
    * - 单行失败不影响其他行，最终返回统计 + 失败明细

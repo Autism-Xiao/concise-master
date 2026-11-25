@@ -4,7 +4,7 @@ import type { Response } from 'express'
 
 import { OperLog } from '../../../common/decorators/oper-log.decorator'
 import { Perms } from '../../../common/decorators/perms.decorator'
-import { formatDateTime } from '../../../utils/csv.util'
+import { formatDateTime } from '../../../utils/date.util'
 import { setDownloadHeaders } from '../../../utils/download.util'
 import { buildXlsx } from '../../../utils/xlsx.util'
 import { CreateJobDto } from './dto/create-job.dto'

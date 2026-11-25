@@ -20,9 +20,8 @@ pids/
 coverage/
 .nyc_output/
 
-# 数据库备份（含真实数据，体积大，可再生）
+# 数据库备份与 SQL 脚本（含真实数据，体积大，可再生）
 *.sql
-!scripts/wipe-to-admin-menus.sql
 
 # WorkBuddy 工作区数据
 .workbuddy/

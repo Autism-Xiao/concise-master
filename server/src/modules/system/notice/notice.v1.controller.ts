@@ -20,12 +20,9 @@ import { IsIn, IsOptional } from 'class-validator'
 import type { Response } from 'express'
 
 import { BatchDeleteDto } from '../../../common/dto/batch-delete.dto'
-import { BizErrorCode } from '../../../common/enums/biz-error-code.enum'
-import { BizException } from '../../../common/exceptions/biz.exception'
 import { OperLog } from '../../../common/decorators/oper-log.decorator'
 import { Perms } from '../../../common/decorators/perms.decorator'
 import { PagerDto } from '../../../common/dto/pager.dto'
-import { parseCsv } from '../../../utils/csv.util'
 import { setDownloadHeaders } from '../../../utils/download.util'
 import { buildImportTemplateXlsx, readXlsxTable } from '../../../utils/xlsx.util'
 import { CreateNoticeDto } from './dto/create-notice.dto'
@@ -110,13 +107,13 @@ export class NoticeV1Controller {
 
   @ApiOperation({
     summary: '导入公告 Excel（v1）',
-    description: 'multipart/form-data，字段名 file；支持 .xlsx（推荐）与 .csv；标题已存在则更新该条，否则新增；指定用户按账号/姓名解析；单行失败不影响其他行'
+    description: 'multipart/form-data，字段名 file；仅支持 .xlsx；标题已存在则更新该条，否则新增；指定用户按账号/姓名解析；单行失败不影响其他行'
   })
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {
       type: 'object',
-      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤1000 行）；兼容 .csv（UTF-8）' } },
+      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤1000 行）' } },
       required: ['file']
     }
   })
@@ -135,14 +132,7 @@ export class NoticeV1Controller {
       const table = await readXlsxTable(file.buffer, { headerKeys: ['标题', '公告标题', 'title'] })
       return this.noticeService.importNotices(table.rows, table.headerRow, operator)
     }
-    if (/\.csv$/i.test(filename)) {
-      const text = file.buffer.toString('utf8')
-      if (text.includes('\uFFFD')) {
-        throw new BizException(BizErrorCode.IMPORT_CSV_ENCODING, 'CSV 文件编码不是 UTF-8，请改用 .xlsx 导入，或另存为「CSV UTF-8（逗号分隔）」')
-      }
-      return this.noticeService.importNotices(parseCsv(text), 1, operator)
-    }
-    throw new BadRequestException('仅支持 .xlsx（推荐）或 .csv 文件')
+    throw new BadRequestException('仅支持 .xlsx 文件，请下载模板填写后导入')
   }
 
   @ApiOperation({ summary: '公告详情（v1）' })

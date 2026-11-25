@@ -4,11 +4,9 @@ import { FileInterceptor } from '@nestjs/platform-express'
 import type { Response } from 'express'
 
 import { BatchDeleteDto } from '../../common/dto/batch-delete.dto'
-import { BizErrorCode } from '../../common/enums/biz-error-code.enum'
-import { BizException } from '../../common/exceptions/biz.exception'
 import { Perms } from '../../common/decorators/perms.decorator'
 import { OperLog } from '../../common/decorators/oper-log.decorator'
-import { formatDateTime, parseCsv } from '../../utils/csv.util'
+import { formatDateTime } from '../../utils/date.util'
 import { Pagination } from '../../helper/paginate'
 import { setDownloadHeaders } from '../../utils/download.util'
 import { buildImportTemplateXlsx, buildXlsx, readXlsxTable } from '../../utils/xlsx.util'
@@ -110,13 +108,13 @@ export class RoleV1Controller {
   @ApiOperation({
     summary: '导入角色 Excel（v1）',
     description:
-      'multipart/form-data，字段名 file；支持 .xlsx（推荐）与 .csv；按角色编码判定新增/更新（已存在只覆盖名称与描述，不动菜单授权）；单行失败不影响其他行'
+      'multipart/form-data，字段名 file；仅支持 .xlsx；按角色编码判定新增/更新（已存在只覆盖名称与描述，不动菜单授权）；单行失败不影响其他行'
   })
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {
       type: 'object',
-      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）；兼容 .csv（UTF-8）' } },
+      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）' } },
       required: ['file']
     }
   })
@@ -134,15 +132,7 @@ export class RoleV1Controller {
       const table = await readXlsxTable(file.buffer, { headerKeys: ['角色编码', '权限字符', 'roleCode'] })
       return this.roleService.importRoles(table.rows, table.headerRow)
     }
-    if (/\.csv$/i.test(filename)) {
-      const text = file.buffer.toString('utf8')
-      // utf8 解码失败会产生替换字符，明确报错比入库乱码好排查
-      if (text.includes('\uFFFD')) {
-        throw new BizException(BizErrorCode.IMPORT_CSV_ENCODING, 'CSV 文件编码不是 UTF-8，请改用 .xlsx 导入，或另存为「CSV UTF-8（逗号分隔）」')
-      }
-      return this.roleService.importRoles(parseCsv(text), 1)
-    }
-    throw new BadRequestException('仅支持 .xlsx（推荐）或 .csv 文件')
+    throw new BadRequestException('仅支持 .xlsx 文件，请下载模板填写后导入')
   }
 
   @ApiOperation({ summary: '角色详情（v1，含已授权菜单）', description: '需 system:role:list' })

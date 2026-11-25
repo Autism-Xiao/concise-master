@@ -1,7 +1,7 @@
 import { StreamableFile } from '@nestjs/common'
 import type { Response } from 'express'
 
-import { formatDateTime } from '../../utils/csv.util'
+import { formatDateTime } from '../../utils/date.util'
 import { setDownloadHeaders } from '../../utils/download.util'
 import { buildXlsx, type XlsxCellStyleResolver, type XlsxCellValue, type XlsxColumn } from '../../utils/xlsx.util'
 

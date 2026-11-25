@@ -363,7 +363,7 @@ export function NoticePage() {
           onOpenChange={setImportOpen}
           title="导入公告"
           description={
-            '按「标题」判定：标题已存在则更新该条，不存在则新增。更新时只覆盖填了值的列，留空表示不改。状态填「已发布」会立即上线并记录发布人与发布时间。支持 .xlsx（推荐）与 .csv，单次最多 1000 行。'
+            '按「标题」判定：标题已存在则更新该条，不存在则新增。更新时只覆盖填了值的列，留空表示不改。状态填「已发布」会立即上线并记录发布人与发布时间。仅支持 .xlsx，单次最多 1000 行。'
           }
           warning={
             <>
@@ -371,7 +371,7 @@ export function NoticePage() {
               （含内容、状态、生效时间与通告对象）。请先删掉模板里的示例行，并核对标题是否与线上公告重名。
             </>
           }
-          accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv"
+          accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
           templateHint="模板含填写说明与示例，必填列带 *"
           onImported={reload}
           downloadTemplate={downloadNoticeTemplate}

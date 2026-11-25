@@ -139,7 +139,7 @@ export function downloadNoticeTemplate(): Promise<{ filename: string; blob: Blob
   return downloadFromApi('/v1/notices/import-template', 'notices-import-template.xlsx')
 }
 
-/** 导入公告（multipart，字段名 file；支持 .xlsx/.csv，标题已存在则更新） */
+/** 导入公告（multipart，字段名 file；仅支持 .xlsx，标题已存在则更新） */
 export function importNotices(file: File): Promise<NoticeImportResult> {
   const form = new FormData()
   form.append('file', file)

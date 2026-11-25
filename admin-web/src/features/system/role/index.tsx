@@ -498,9 +498,9 @@ export function RolePage() {
           open={importOpen}
           onOpenChange={setImportOpen}
           title="导入角色"
-          description="按「角色编码」判定：不存在则新增，已存在则覆盖名称与描述（不动已授权菜单）。支持 .xlsx（推荐）与 .csv，单次最多 2000 行。"
+          description="按「角色编码」判定：不存在则新增，已存在则覆盖名称与描述（不动已授权菜单）。仅支持 .xlsx，单次最多 2000 行。"
           warning="已存在的「角色编码」会覆盖名称与描述（不影响已授权菜单）。示例写在模板的第二张工作表里，不会参与导入。"
-          accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv"
+          accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
           onImported={reload}
           downloadTemplate={downloadRoleTemplate}
           importFile={file => importRoles(file).then(r => ({ ...r, errors: r.errors.map(e => ({ ...e, label: e.roleCode })) }))}

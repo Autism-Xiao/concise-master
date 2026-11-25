@@ -558,13 +558,13 @@ export function UsersPage() {
             open={importOpen}
             onOpenChange={setImportOpen}
             title="导入用户"
-            description="按「登录账号」判定：不存在则新增（密码留空将生成随机初始密码，并在导入结果里展示一次），已存在则更新填写了的字段。部门/角色按名称匹配，多个用「/」分隔。支持 .xlsx（推荐）与 .csv，单次最多 2000 行。"
+            description="按「登录账号」判定：不存在则新增（密码留空将生成随机初始密码，并在导入结果里展示一次），已存在则更新填写了的字段。部门/角色按名称匹配，多个用「/」分隔。仅支持 .xlsx，单次最多 2000 行。"
             warning={
               <>
                 已存在的「登录账号」会被<b className="font-medium">覆盖</b>（含密码、角色、状态与部门），不是只跳过。导入前请核对文件里有没有误填系统账号。
               </>
             }
-            accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             onImported={reload}
             downloadTemplate={downloadUserTemplate}
             importFile={file => importUsers(file).then(r => ({ ...r, errors: r.errors.map(e => ({ ...e, label: e.username })) }))}

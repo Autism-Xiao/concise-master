@@ -38,7 +38,7 @@ interface ExcelImportDialogProps {
   /** 风险提示（覆盖、删数据等），不传则不显示 */
   warning?: ReactNode
   templateHint?: ReactNode
-  /** 选择文件时接受的格式，默认仅 xlsx；需要 csv 的模块传完整 accept 串 */
+  /** 选择文件时接受的格式，仅 xlsx */
   accept?: string
   /** 导入成功（含部分成功）时回调，父组件据此刷新列表 */
   onImported: () => void

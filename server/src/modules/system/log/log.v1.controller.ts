@@ -11,7 +11,7 @@ import { PagerDto } from '../../../common/dto/pager.dto'
 import { sendXlsx } from '../../../helper/export/excel-export'
 import { IMPORT_MAX_SIZE } from '../../../helper/import/excel-import'
 import { readImportFile } from '../../../helper/import/import-file'
-import { formatDateTime } from '../../../utils/csv.util'
+import { formatDateTime } from '../../../utils/date.util'
 import { setDownloadHeaders } from '../../../utils/download.util'
 import { buildImportTemplateXlsx } from '../../../utils/xlsx.util'
 import { ChangeLogService } from './change-log.service'
@@ -268,13 +268,13 @@ export class LogV1Controller {
 
   @ApiOperation({
     summary: '导入登录日志 Excel（v1）',
-    description: 'multipart/form-data，字段名 file；支持 .xlsx（推荐）与 .csv；按「用户名」为必填列，只新增不覆盖；单行失败不影响其他行'
+    description: 'multipart/form-data，字段名 file；仅支持 .xlsx；按「用户名」为必填列，只新增不覆盖；单行失败不影响其他行'
   })
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {
       type: 'object',
-      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）；兼容 .csv（UTF-8）' } },
+      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）' } },
       required: ['file']
     }
   })
@@ -393,13 +393,13 @@ export class LogV1Controller {
 
   @ApiOperation({
     summary: '导入操作日志 Excel（v1）',
-    description: 'multipart/form-data，字段名 file；支持 .xlsx（推荐）与 .csv；必填列 操作人/模块/操作，只新增不覆盖；单行失败不影响其他行'
+    description: 'multipart/form-data，字段名 file；仅支持 .xlsx；必填列 操作人/模块/操作，只新增不覆盖；单行失败不影响其他行'
   })
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {
       type: 'object',
-      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）；兼容 .csv（UTF-8）' } },
+      properties: { file: { type: 'string', format: 'binary', description: 'Excel 文件（.xlsx，≤5MB，≤2000 行）' } },
       required: ['file']
     }
   })
