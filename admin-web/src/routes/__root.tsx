@@ -1,0 +1,47 @@
+import { createRootRoute, Outlet } from '@tanstack/react-router'
+import { ThemeProvider } from 'next-themes'
+import { Toaster } from '@/components/ui/sonner'
+import { TooltipProvider } from '@/components/ui/tooltip'
+import { CommandMenu } from '@/components/command-menu'
+import { NavigationProgress } from '@/components/navigation-progress'
+import { SessionExpiredDialog } from '@/components/session-expired-dialog'
+import { SearchProvider } from '@/context/search-provider'
+import { ShortcutProvider } from '@/context/shortcut-provider'
+import { LocaleProvider } from '@/context/locale-provider'
+import { SettingsProvider } from '@/context/settings-provider'
+import { NotFoundError } from '@/features/errors'
+import { ErrorBoundary } from '@/components/error-boundary'
+
+export const Route = createRootRoute({
+  component: RootLayout,
+  notFoundComponent: () => (
+    <div className="flex min-h-screen items-center justify-center">
+      <NotFoundError />
+    </div>
+  )
+})
+
+function RootLayout() {
+  return (
+    <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+      <LocaleProvider>
+        <SettingsProvider>
+          <ShortcutProvider>
+            <SearchProvider>
+              <TooltipProvider>
+                <ErrorBoundary title="应用布局加载失败">
+                  <Outlet />
+                </ErrorBoundary>
+                <CommandMenu />
+                <NavigationProgress />
+                <SessionExpiredDialog />
+                <Toaster richColors position="top-center" />
+              </TooltipProvider>
+            </SearchProvider>
+          </ShortcutProvider>
+        </SettingsProvider>
+      </LocaleProvider>
+      {/* <TanStackRouterDevtools /> */}
+    </ThemeProvider>
+  )
+}

@@ -1,0 +1,426 @@
+import { batchDeleteRequest, type BatchDeleteResult } from '@/lib/batch-delete'
+import { downloadFromApi } from '@/lib/download'
+import { getApiResult, type PageResult } from '@/lib/http'
+import {
+  batchUpdateUsersWatermark,
+  updateUserWatermark,
+  type BatchWatermarkMode,
+  type BatchWatermarkResult,
+  type UserWatermarkPatch,
+  type WatermarkDensity
+} from '@/lib/watermark'
+import { fetchRoleOptions, type Role } from '@/features/system/role/api'
+
+/** 后端 sys_user，只保留页面需要的字段 */
+export interface User {
+  id: string
+  username: string
+  realname?: string
+  email?: string
+  phone?: string
+  telephone?: string
+  workNo?: string
+  sex?: number
+  /** 头像相对路径；null / 缺省 = 系统默认头像 */
+  avatar?: string | null
+  birthday?: string
+  /** 1 正常 / 2 冻结 */
+  status: number
+  createTime?: string
+  /** 个人简介（个人资料页可自助编辑，255 字符） */
+  bio?: string | null
+  /** 回收站行用：软删时间（update_time） */
+  updateTime?: string
+  roles?: Pick<Role, 'id' | 'roleName' | 'roleCode'>[]
+  depts?: Array<{ id: string; departName: string }>
+  /** 岗位列表（sys_user_post） */
+  posts?: Array<{ id: string; postName?: string; postCode?: string }>
+  /** 职级 ID（sys_level，单选可空） */
+  levelId?: string | null
+  /** 职级（后端批量组装，只含 id/levelName） */
+  level?: { id: string; levelName: string } | null
+  /** 密码过期时间（ISO 字符串；空 = 不限制） */
+  passwordExpireAt?: string | null
+  /** 下次登录强制改密：1 是 / 0 否 */
+  mustChangePassword?: number
+  /** 主部门 id（后端兼容字段 = depts[0].id） */
+  deptId?: string | null
+  /** 水印原始设置：1 开 / 0 关 / null 继承全局（列表由后端批量组装） */
+  watermarkEnabled?: number | null
+  /** 强管控：0 不强制 / 1 强制开 / 2 强制关 */
+  watermarkEnforced?: number
+  /** 最终是否生效（已合并全局策略） */
+  watermarkEffective?: boolean
+  /** 平台管理员：1 是 / 0 否（可跨租户视角、可访问平台级权限点） */
+  isPlatformAdmin?: number
+  /** 会员等级：0 普通 / 1 VIP（VIP 可自助开通租户） */
+  vipLevel?: number
+  /** VIP 到期时间（ISO；空 = 永久） */
+  vipExpireAt?: string | null
+}
+
+export { batchUpdateUsersWatermark, updateUserWatermark }
+export type { BatchWatermarkMode, BatchWatermarkResult, UserWatermarkPatch, WatermarkDensity }
+
+export interface UserWritePayload {
+  /** 新增必填；编辑时后端不可改，不下发 */
+  username?: string
+  realname?: string
+  /** 新增必填；编辑不传表示不改密码 */
+  password?: string
+  email?: string
+  phone?: string
+  telephone?: string
+  workNo?: string
+  sex?: number
+  status?: number
+  roleIds?: string[]
+  deptIds?: string[]
+  postIds?: string[]
+  /** 职级 ID（单选；null/'' 表示不设置） */
+  levelId?: string | null
+  /** 密码过期时间（YYYY-MM-DD 或 ISO；不传表示不改，传空串清除） */
+  passwordExpireAt?: string | null
+  /** 下次登录强制改密：1 是 / 0 否 */
+  mustChangePassword?: number
+}
+
+export interface UserListResult {
+  records: User[]
+  total: number
+  current: number
+  size: number
+  pages: number
+  /** 是否还有下一页（skipCount 快路径下 total/pages 为 -1，只能看这个） */
+  hasNext?: boolean
+}
+
+/** 用户简要信息（选人控件回显用：只有 id / 账号 / 姓名） */
+export interface UserBrief {
+  id: string
+  username: string
+  realname?: string
+}
+
+/**
+ * 批量按 ID 查账号（选人控件回显）：最多 100 个，后端过滤已软删；
+ * 登录即可调用，不要求 system:user:list，公告/日程等场景也能回显已选人。
+ */
+export function lookupUsers(ids: string[]): Promise<UserBrief[]> {
+  const list = ids
+    .map(id => id.trim())
+    .filter(Boolean)
+    .slice(0, 100)
+  if (!list.length) return Promise.resolve([])
+  return getApiResult<UserBrief[]>(`/backend-api/v1/users/lookup?ids=${encodeURIComponent(list.join(','))}`)
+}
+
+/**
+ * 分页查询用户列表（大页容量一次拉全，前端表格本地筛选）
+ *
+ * 选择器类场景（批量分配角色、租户加人）用这个：它们需要一批候选用户做本地过滤。
+ * 用户管理列表页走 `fetchUserPage`（服务端分页/搜索/排序）。
+ *
+ * skipCount=true：不统计总数。千万行表上 `SELECT COUNT(*) WHERE del_flag=0` 要走全索引扫描
+ * （实测 17.8 秒），而列表页只需要知道「是否还有更多」。返回 total/pages = -1、带 hasNext。
+ */
+export function fetchUsers(keyword = '', status = ''): Promise<UserListResult> {
+  const params = new URLSearchParams({ page: '1', pageSize: '100', skipCount: 'true' })
+  if (keyword) params.set('keyword', keyword)
+  if (status) params.set('status', status)
+  return getApiResult<UserListResult>(`/backend-api/v1/users?${params.toString()}`)
+}
+
+/** 用户列表页的服务端分页查询：搜索/状态/部门/排序/翻页全部由接口完成 */
+export function fetchUserPage(params: {
+  page: number
+  pageSize: number
+  keyword?: string
+  status?: string
+  /** 部门过滤（含子孙部门由前端展开后传入，逗号分隔取并集） */
+  deptIds?: string[]
+  sortBy?: string
+  sortOrder?: 'asc' | 'desc'
+}): Promise<UserListResult> {
+  const qs = new URLSearchParams({ page: String(params.page), pageSize: String(params.pageSize) })
+  if (params.keyword) qs.set('keyword', params.keyword)
+  if (params.status) qs.set('status', params.status)
+  if (params.deptIds?.length) qs.set('deptIds', params.deptIds.join(','))
+  if (params.sortBy) {
+    qs.set('sortBy', params.sortBy)
+    qs.set('sortOrder', params.sortOrder ?? 'asc')
+  }
+  return getApiResult<UserListResult>(`/backend-api/v1/users?${qs.toString()}`)
+}
+
+/**
+ * 翻页拉取全站用户简要列表（「全站用户」一键全选用）
+ *
+ * 后端列表接口 pageSize 有上限（100），这里按满页循环直到拉完或达到 max
+ * （后端消息接收人 DTO 上限 1000）；返回简要字段 + 是否被 max 截断。
+ */
+export async function fetchAllUserBriefs(max = 1000): Promise<{ users: UserBrief[]; truncated: boolean }> {
+  const users: UserBrief[] = []
+  for (let page = 1; users.length < max; page++) {
+    const params = new URLSearchParams({ page: String(page), pageSize: '100' })
+    const res = await getApiResult<UserListResult>(`/backend-api/v1/users?${params.toString()}`)
+    const batch = (res.records ?? []).map(u => ({ id: u.id, username: u.username, realname: u.realname }))
+    users.push(...batch)
+    // 满页才可能还有下一页；不满页说明已到末尾
+    if (batch.length < 100) break
+  }
+  const truncated = users.length > max
+  return { users: users.slice(0, max), truncated }
+}
+
+export function createUser(payload: UserWritePayload): Promise<User> {
+  return getApiResult<User>('/backend-api/v1/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
+export function updateUser(id: string, payload: UserWritePayload): Promise<User> {
+  return getApiResult<User>(`/backend-api/v1/users/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
+export function deleteUser(id: string): Promise<unknown> {
+  return getApiResult<unknown>(`/backend-api/v1/users/${id}`, { method: 'DELETE' })
+}
+
+/** 批量删除用户：走后端统一接口，逐条结算（内置管理员会返回失败原因） */
+export function deleteUsers(ids: string[]): Promise<BatchDeleteResult> {
+  return batchDeleteRequest('users', ids)
+}
+
+/** 批量启用/停用：与单条同规则（admin 不可停用、停用踢会话），单条失败不阻断 */
+export function batchUpdateUsersStatus(
+  ids: string[],
+  status: 1 | 2,
+  reason?: string
+): Promise<{ updated: number; kicked: number; skipped: Array<{ id: string; username: string; reason: string }> }> {
+  return getApiResult('/backend-api/v1/users/batch-status', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, status, reason: reason || undefined })
+  })
+}
+
+/** 批量分配角色：对列表内每个用户全量覆盖绑定同一组角色 */
+export function batchAssignRoles(ids: string[], roleIds: string[]): Promise<{ updated: number }> {
+  return getApiResult('/backend-api/v1/users/batch-roles', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, roleIds })
+  })
+}
+
+/** 清除用户权限缓存：按用户挂的角色逐个失效（改角色/权限后未生效时用） */
+export function clearUserPermissionCache(id: string): Promise<{ cleared: number }> {
+  return getApiResult(`/backend-api/v1/users/${id}/permission-cache`, { method: 'DELETE' })
+}
+
+/** 管理员重置用户头像：清除自定义头像，恢复系统默认 */
+export function resetUserAvatar(id: string): Promise<{ avatar: string | null }> {
+  return getApiResult(`/backend-api/v1/users/${id}/avatar`, { method: 'DELETE' })
+}
+
+/** 设置我的头像：avatar 传上传接口返回的相对路径；空串/null 清除 */
+export function setMyAvatar(avatar: string | null): Promise<{ avatar: string | null }> {
+  return getApiResult('/backend-api/v1/users/me/avatar', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ avatar: avatar ?? '' })
+  })
+}
+
+/* ---------- 个人资料自助（/v1/users/me） ---------- */
+
+/**
+ * 我的资料可编辑字段：空串 = 清空该字段（后端会归一成 NULL）
+ *
+ * 只有白名单字段能改 —— 账号、工号、状态、角色、部门、密码都不在这个接口里，
+ * 后端也会用 whitelist 把多余键丢掉，前端就算拼错字段名也不会越权。
+ */
+export interface MyProfilePatch {
+  realname?: string
+  email?: string
+  phone?: string
+  telephone?: string
+  sex?: number
+  birthday?: string
+  bio?: string
+  /** 当前密码：修改邮箱时必填（邮箱是忘记密码链路的收件凭证，后端强校验） */
+  password?: string
+}
+
+/** 当前登录用户的完整资料（含角色/部门/岗位/职级）；登录即可调用，不需要 system:user:list */
+export function fetchMyProfile(): Promise<User> {
+  return getApiResult<User>('/backend-api/v1/users/me')
+}
+
+/** 自助更新个人资料：返回更新后的完整资料 */
+export function updateMyProfile(payload: MyProfilePatch): Promise<User> {
+  return getApiResult<User>('/backend-api/v1/users/me', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
+export { fetchRoleOptions }
+export type { Role }
+
+/* ---------- 管辖部门（ReBAC 监管数据权限） ---------- */
+
+/** 读取用户当前租户下被授权监管的部门 id（配置回显用） */
+export function fetchUserSuperviseDepts(id: string): Promise<string[]> {
+  return getApiResult<{ deptIds: string[] }>(`/backend-api/v1/users/${id}/supervise-depts`).then(r => r.deptIds ?? [])
+}
+
+/** 配置用户管辖部门（全量覆盖；后端自动展开子孙部门，仅对 data_scope 部门档生效） */
+export function assignUserSuperviseDepts(id: string, deptIds: string[]): Promise<unknown> {
+  return getApiResult(`/backend-api/v1/users/${id}/supervise-depts`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deptIds })
+  })
+}
+
+/** 后端部门列表（/api/v1/depts 扁平结构，供用户表单部门下拉使用；响应为统一分页结构） */
+export async function fetchBackendDepts(): Promise<Array<{ id: string; departName: string; parentId?: string | null; status?: string }>> {
+  const page = await getApiResult<{ records: Array<{ id: string; departName: string; parentId?: string | null; status?: string }> }>('/backend-api/v1/depts')
+  return page.records
+}
+
+/* ---------- 管理操作：重置密码 / 冻结 / 强制下线 / 解锁 / 回收站 ---------- */
+
+/** 重置密码：password 留空则后端生成 12 位随机口令；明文仅在本次返回，务必立即展示给管理员 */
+export function resetUserPassword(id: string, password?: string): Promise<{ password: string }> {
+  return getApiResult<{ password: string }>(`/backend-api/v1/users/${id}/password`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: password || undefined })
+  })
+}
+
+/** 冻结/解冻：status 1 正常 / 2 冻结（冻结自动踢掉全部在线会话），返回踢掉会话数 */
+export function updateUserStatus(id: string, status: 1 | 2): Promise<{ status: number; kicked: number }> {
+  return getApiResult<{ status: number; kicked: number }>(`/backend-api/v1/users/${id}/status`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status })
+  })
+}
+
+/** 强制下线：踢掉该用户全部在线会话，返回踢掉会话数 */
+export function forceOfflineUser(id: string): Promise<{ kicked: number }> {
+  return getApiResult<{ kicked: number }>(`/backend-api/v1/users/${id}/force-offline`, { method: 'POST' })
+}
+
+/** 解锁账号：清零登录失败计数（幂等） */
+export function unlockUser(id: string): Promise<{ unlocked: true }> {
+  return getApiResult<{ unlocked: true }>(`/backend-api/v1/users/${id}/lock`, { method: 'DELETE' })
+}
+
+/**
+ * 授予/取消平台管理员
+ *
+ * 平台级操作：后端要求调用者自身就是平台管理员（权限点 scope=platform），
+ * 且拒绝「取消自己」与「取消系统最后一个平台管理员」。
+ */
+export function setUserPlatformAdmin(id: string, isPlatformAdmin: boolean): Promise<User> {
+  return getApiResult<User>(`/backend-api/v1/users/${id}/platform-admin`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ isPlatformAdmin })
+  })
+}
+
+/**
+ * 授予/取消 VIP（可自助开通租户的资格）
+ *
+ * 平台级操作（权限点 system:user:vip 的 scope=platform）；取消 VIP 不回收已开租户。
+ * vipExpireAt 传 YYYY-MM-DD，留空表示永久。
+ */
+export function setUserVip(id: string, vipLevel: 0 | 1, vipExpireAt?: string): Promise<User> {
+  return getApiResult<User>(`/backend-api/v1/users/${id}/vip`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ vipLevel, vipExpireAt: vipExpireAt ?? '' })
+  })
+}
+
+/** 回收站：已软删用户分页列表 */
+export function fetchRecycledUsers(params: { keyword?: string; page?: number; pageSize?: number } = {}): Promise<PageResult<User>> {
+  const qs = new URLSearchParams()
+  if (params.keyword) qs.set('keyword', params.keyword)
+  qs.set('page', String(params.page ?? 1))
+  qs.set('pageSize', String(params.pageSize ?? 10))
+  return getApiResult<PageResult<User>>(`/backend-api/v1/users/recycled?${qs.toString()}`)
+}
+
+/** 恢复软删用户：可顺带重绑角色/部门；用户名被占用时后端拒绝 */
+export function restoreUser(id: string, payload: { roleIds?: string[]; deptIds?: string[] } = {}): Promise<User> {
+  return getApiResult<User>(`/backend-api/v1/users/${id}/restore`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
+/** 自助修改密码：验旧密码；成功后其他端全部下线，当前会话保留 */
+export function changeMyPassword(oldPassword: string, newPassword: string): Promise<{ changed: true }> {
+  return getApiResult<{ changed: true }>('/backend-api/v1/auth/password', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ oldPassword, newPassword })
+  })
+}
+
+/* ---------- 导入导出（/api/v1/users/export | import | import-template） ---------- */
+
+/** 导入结果：后端逐行统计 + 失败明细 + 新建账号的随机初始密码回执 */
+export interface UserImportResult {
+  total: number
+  created: number
+  updated: number
+  skipped: number
+  failed: number
+  errors: Array<{ row: number; username: string; message: string }>
+  /** 密码列留空时后端逐行生成的随机初始密码（明文仅本次返回） */
+  generatedPasswords: Array<{ row: number; username: string; password: string }>
+}
+
+/** 导出用户 Excel（与列表同过滤条件，不传即全量） */
+export function exportUsers(params: { keyword?: string; status?: string; deptIds?: string[] } = {}): Promise<{ filename: string; blob: Blob }> {
+  const qs = new URLSearchParams()
+  if (params.keyword) qs.set('keyword', params.keyword)
+  if (params.status) qs.set('status', params.status)
+  if (params.deptIds?.length) qs.set('deptIds', params.deptIds.join(','))
+  const query = qs.toString()
+  return downloadFromApi(`/v1/users/export${query ? `?${query}` : ''}`, 'users.xlsx')
+}
+
+/** 下载用户导入模板 Excel（第一个工作表为模板，第二个为填写示例） */
+export function downloadUserTemplate(): Promise<{ filename: string; blob: Blob }> {
+  return downloadFromApi('/v1/users/import-template', 'users-import-template.xlsx')
+}
+
+/** 导入用户（multipart，字段名 file；支持 .xlsx/.csv，按登录账号新增或更新） */
+export function importUsers(file: File): Promise<UserImportResult> {
+  const form = new FormData()
+  form.append('file', file)
+  return getApiResult<UserImportResult>('/backend-api/v1/users/import', { method: 'POST', body: form })
+}
+
+/** 状态展示映射（对齐后端 1 正常 / 2 冻结） */
+export const userStatusMap: Record<number, { label: string; className: string }> = {
+  1: { label: '正常', className: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' },
+  2: { label: '冻结', className: 'bg-destructive/15 text-destructive' }
+}

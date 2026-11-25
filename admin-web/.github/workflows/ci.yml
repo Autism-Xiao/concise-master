@@ -1,0 +1,47 @@
+name: Admin CI
+
+# 前端质量闸门：类型 + 构建 + lint + 单测。
+# 与后端 CI 独立：后端改动不会因前端构建失败被拖住，反之亦然。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: admin-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: 构建 + 静态检查 + 单测
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ./
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查与构建
+        run: pnpm run build
+
+      - name: ESLint
+        run: pnpm run lint
+
+      - name: 单元测试
+        run: pnpm test

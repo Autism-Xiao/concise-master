@@ -1,0 +1,258 @@
+import { Injectable, BadRequestException, HttpStatus, NotFoundException } from '@nestjs/common'
+import { InjectRepository } from '@nestjs/typeorm'
+import { Repository, type DeepPartial } from 'typeorm'
+
+import { BaseService } from '../../../helper/crud/base.service'
+import { BizErrorCode } from '../../../common/enums/biz-error-code.enum'
+import { BizException } from '../../../common/exceptions/biz.exception'
+import { applyTenantScope, tenantWriteCondition } from '../../../shared/tenant/tenant-scope.util'
+import { normalizeBatchIds, runBatchDelete, type BatchDeleteResult } from '../../../helper/crud/batch-delete'
+import { UserEntity } from '../../user/entities/user.entity'
+import { DeptEntity } from './entities/dept.entity'
+import type { CreateDeptDto } from './dto/create-dept.dto'
+import { sqlUpdateUserOrgCode } from '../../../shared/database/sql-dialect'
+import { queryRaw } from '../../../shared/database/raw-query'
+
+export interface DeptTreeItem extends DeptEntity {
+  children: DeptTreeItem[]
+}
+
+/** 顶级部门的 parent_id 约定（null 或空串均视为顶级） */
+function isRootParent(parentId?: string | null): boolean {
+  return parentId === null || parentId === undefined || parentId === ''
+}
+
+@Injectable()
+export class DeptService extends BaseService<DeptEntity> {
+  constructor(
+    @InjectRepository(DeptEntity)
+    repository: Repository<DeptEntity>
+  ) {
+    super(repository, '部门')
+  }
+
+  /**
+   * 父级部门必须存在：转成专用码 4101，而不是通用 1002「部门不存在」。
+   * 用户看到的「部门不存在」分不清是自己要改的部门还是选的父级，前端也没法据此定位到父级选择器。
+   */
+  private async assertParentExists(parentId: string): Promise<DeptEntity> {
+    try {
+      return await this.findOne(parentId)
+    } catch (err) {
+      if (err instanceof NotFoundException) {
+        throw new BizException(BizErrorCode.DEPT_PARENT_NOT_FOUND, '父级部门不存在', HttpStatus.BAD_REQUEST)
+      }
+      throw err
+    }
+  }
+
+  /** 创建：校验父级存在、自动生成 orgCode */
+  async create(dto: CreateDeptDto): Promise<DeptEntity> {
+    const parentId = dto.parentId || null
+    if (parentId) {
+      await this.assertParentExists(parentId)
+    }
+    const orgCode = dto.orgCode || (await this.generateOrgCode(parentId))
+    // 手工指定编码时前置查重（联合唯一键 (tenant_id, org_code)，撞了会 500，这里转 400 人话）
+    if (dto.orgCode && (await this.isOrgCodeTaken(orgCode))) {
+      throw new BadRequestException(`部门编码「${orgCode}」已被占用`)
+    }
+    return super.create({
+      ...dto,
+      parentId,
+      orgCode,
+      status: dto.status ?? '1',
+      delFlag: '0',
+      orgCategory: dto.orgCategory ?? '2',
+      createTime: new Date()
+    })
+  }
+
+  /** 更新：父级不能指向自己或自己的后代（防环）；改父级时同步重算 orgCode */
+  async update(id: string, dto: DeepPartial<DeptEntity>): Promise<DeptEntity> {
+    const before = await this.findOne(id)
+    // 手工改编码时前置查重（排除自身），避免撞唯一索引变 500
+    if (dto.orgCode && dto.orgCode !== before.orgCode && (await this.isOrgCodeTaken(dto.orgCode))) {
+      throw new BadRequestException(`部门编码「${dto.orgCode}」已被占用`)
+    }
+    if (dto.parentId !== undefined) {
+      const parentId = dto.parentId || null
+      if (parentId === id) {
+        throw new BizException(BizErrorCode.DEPT_CYCLE, '父级部门不能是自身', HttpStatus.BAD_REQUEST)
+      }
+      if (parentId) {
+        await this.assertParentExists(parentId)
+        const all = await this.repository.find()
+        const descendantIds = this.collectDescendantIds(all, id)
+        if (descendantIds.has(parentId)) {
+          throw new BizException(BizErrorCode.DEPT_CYCLE, '父级部门不能是自己的下级', HttpStatus.BAD_REQUEST)
+        }
+      }
+      dto.parentId = parentId
+      // 只有父级真的变了才重算编码：同父级内拖拽排序也带 parentId，不能把手编的编码（如 NANSHAN）冲掉
+      if (!dto.orgCode && (dto.parentId || null) !== (before.parentId || null)) {
+        dto.orgCode = await this.generateOrgCode(parentId)
+      }
+    }
+    dto.updateTime = new Date()
+    const updated = await super.update(id, dto)
+    // 机构编码变了，把挂了该部门的用户 sys_user.org_code 一并刷新（上面存的是冗余值）
+    if (updated.orgCode && updated.orgCode !== before.orgCode) {
+      await queryRaw(this.repository.manager, sqlUpdateUserOrgCode(), [updated.orgCode, id])
+    }
+    return updated
+  }
+
+  /** 删除：有下级或挂了（未删除的）用户时不允许删（软删，置 del_flag='1'） */
+  async delete(id: string): Promise<void> {
+    // 用严格写范围加载：共享部门（tenant_id=0）对租户是只读的，不能先做校验再按 id 写
+    await this.findOneForWrite(id)
+    const childCount = await this.repository.count({ where: { parentId: id, delFlag: '0' } })
+    if (childCount > 0) {
+      throw new BizException(BizErrorCode.DEPT_HAS_CHILDREN, '该部门下存在子部门，无法删除', HttpStatus.BAD_REQUEST)
+    }
+    // 走 sys_user_depart 关联表统计，并排除已软删用户（否则删过的人会一直挡住部门删除）
+    const userCount = await this.repository.manager
+      .createQueryBuilder(UserEntity, 'user')
+      .innerJoin('user.depts', 'dept', 'dept.id = :deptId', { deptId: id })
+      .where('user.del_flag = 0')
+      .getCount()
+    if (userCount > 0) {
+      throw new BizException(BizErrorCode.DEPT_HAS_USERS, '该部门下存在用户，无法删除', HttpStatus.BAD_REQUEST)
+    }
+    await this.softDelete(id, { delFlag: '1' })
+  }
+
+  /** 批量删除部门：逐条走 delete，保留「有子部门 / 有用户不可删」的保护并收集原因 */
+  async batchDelete(ids: string[]): Promise<BatchDeleteResult> {
+    const normalized = normalizeBatchIds(ids)
+    const qb = this.repository
+      .createQueryBuilder('dept')
+      .where('dept.id IN (:...ids)', { ids: normalized })
+      .andWhere('dept.del_flag = :delFlag', { delFlag: '0' })
+    // 批量删除同样只处理本租户可写的行：跨租户/共享部门的 id 不进入结果，避免失败明细带出对方名称
+    const condition = tenantWriteCondition('dept.tenant_id')
+    if (condition) qb.andWhere(condition.clause, condition.params)
+    const targets = await qb.getMany()
+    // 部门有层级，删除结果依赖处理顺序：子部门先删掉，父部门的「还有子部门」保护就不再成立。
+    // repository.find 的返回顺序由数据库决定（会变），所以这里显式按入参顺序处理 ——
+    // 结果才是确定的：前端按勾选顺序提交，父部门先到就先被规则挡住，不会时好时坏。
+    const order = new Map(normalized.map((id, index) => [id, index]))
+    targets.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+    return runBatchDelete(
+      targets,
+      {
+        getId: dept => dept.id,
+        getName: dept => dept.departName,
+        remove: dept => this.delete(dept.id)
+      },
+      ids
+    )
+  }
+
+  /**
+   * 导出：在扁平列表上补「完整路径」（研发部 / 前端组），方便直接看懂层级
+   * 路径用父链上溯拼接，带 20 层保护，异常脏数据不会死循环
+   */
+  async exportDepts(keyword?: string): Promise<Array<DeptEntity & { fullPath: string }>> {
+    const all = await this.listAll()
+    const byId = new Map(all.map(dept => [dept.id, dept]))
+    const resolvePath = (dept: DeptEntity): string => {
+      const names: string[] = []
+      let current: DeptEntity | undefined = dept
+      let depth = 0
+      while (current && depth < 20) {
+        names.unshift(current.departName)
+        current = current.parentId ? byId.get(current.parentId) : undefined
+        depth += 1
+      }
+      return names.join(' / ')
+    }
+    const filtered = keyword ? all.filter(dept => (dept.departName ?? '').includes(keyword)) : all
+    return filtered.map(dept => Object.assign(dept, { fullPath: resolvePath(dept) }))
+  }
+
+  /** 全量部门（按 depart_order 升序，排除已删除） */
+  async listAll(): Promise<DeptEntity[]> {
+    const qb = this.repository.createQueryBuilder('d').where('d.delFlag = :delFlag', { delFlag: '0' })
+    applyTenantScope(qb, 'd')
+    return qb.orderBy('d.departOrder', 'ASC').addOrderBy('d.id', 'ASC').getMany()
+  }
+
+  /** 扁平列表转树（parent_id 为 null/'' 视为顶级） */
+  async getTree(): Promise<DeptTreeItem[]> {
+    const all = await this.listAll()
+    return buildDeptTree(all, null)
+  }
+
+  /** 顶级部门 */
+  async listRoots(): Promise<DeptEntity[]> {
+    const qb = this.repository.createQueryBuilder('d').where('d.parentId IS NULL').andWhere('d.delFlag = :delFlag', { delFlag: '0' })
+    applyTenantScope(qb, 'd')
+    return qb.orderBy('d.departOrder', 'ASC').getMany()
+  }
+
+  /**
+   * 生成机构编码，两位字母递增：
+   * - 顶级：A01、A02 ...
+   * - 子级：父编码 + A01（如 A01A01）
+   */
+  private async generateOrgCode(parentId: string | null): Promise<string> {
+    const siblingsQb = this.repository.createQueryBuilder('d')
+    if (parentId) siblingsQb.where('d.parentId = :parentId', { parentId })
+    else siblingsQb.where('d.parentId IS NULL')
+    applyTenantScope(siblingsQb, 'd')
+    const siblings = await siblingsQb.getMany()
+    let prefix = 'A'
+    if (parentId) {
+      const parent = await this.assertParentExists(parentId)
+      prefix = parent.orgCode
+    }
+    let index = siblings.length + 1
+    let code = `${prefix}A${String(index).padStart(2, '0')}`
+    while (await this.isOrgCodeTaken(code)) {
+      index++
+      code = `${prefix}A${String(index).padStart(2, '0')}`
+    }
+    return code
+  }
+
+  /**
+   * 机构编码是否已被占用（租户语义：本租户 ∪ 平台共享行内唯一，租户之间可重码；
+   * 平台视角全局查重。软删行仍占联合唯一键，所以不带 del_flag 条件）
+   */
+  private async isOrgCodeTaken(orgCode: string): Promise<boolean> {
+    const qb = this.repository.createQueryBuilder('d').where('d.orgCode = :orgCode', { orgCode })
+    applyTenantScope(qb, 'd')
+    return qb.getExists()
+  }
+
+  /** 收集某部门所有后代 id */
+  private collectDescendantIds(all: DeptEntity[], rootId: string): Set<string> {
+    const result = new Set<string>()
+    const walk = (parentId: string) => {
+      for (const dept of all) {
+        if (dept.parentId === parentId && !result.has(dept.id)) {
+          result.add(dept.id)
+          walk(dept.id)
+        }
+      }
+    }
+    walk(rootId)
+    return result
+  }
+}
+
+/** list-to-tree：一次取全量后内存组装，不递归查库 */
+export function buildDeptTree(all: DeptEntity[], parentId: string | null): DeptTreeItem[] {
+  return all
+    .filter(dept => (parentId === null ? isRootParent(dept.parentId) : dept.parentId === parentId))
+    .map(dept =>
+      // 实体实例展开为 plain object 组树（响应走 JSON 序列化，无原型丢失问题）
+      // oxlint-disable-next-line typescript(no-misused-spread)
+      ({
+        ...dept,
+        children: buildDeptTree(all, dept.id)
+      })
+    )
+}

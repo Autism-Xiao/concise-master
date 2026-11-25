@@ -1,0 +1,65 @@
+import { type MigrationInterface, type QueryRunner } from 'typeorm'
+
+/**
+ * 与 PG 的 1794080000004 对齐：补齐前端已登记但从未落库的菜单。
+ * INSERT IGNORE + 固定 id，重复执行安全。
+ */
+interface MenuSeed {
+  id: string
+  parentId: string | null
+  name: string
+  url: string
+  menuType: number
+  sort: number
+  icon: string
+  scope: string
+}
+
+const GROUPS: MenuSeed[] = [{ id: 'menu_ops', parentId: null, name: '运维监控', url: '/ops', menuType: 0, sort: 70, icon: 'Activity', scope: 'platform' }]
+
+const LEAVES: MenuSeed[] = [
+  { id: 'menu_role', parentId: 'menu_1', name: '角色管理', url: '/system/role', menuType: 1, sort: 3, icon: 'ShieldCheck', scope: 'tenant' },
+  { id: 'menu_menu', parentId: 'menu_1', name: '菜单管理', url: '/system/menu', menuType: 1, sort: 5, icon: 'ListTree', scope: 'platform' },
+  { id: 'menu_post', parentId: 'menu_1', name: '岗位管理', url: '/system/post', menuType: 1, sort: 7, icon: 'Briefcase', scope: 'tenant' },
+  { id: 'menu_level', parentId: 'menu_1', name: '职级管理', url: '/system/level', menuType: 1, sort: 8, icon: 'Medal', scope: 'tenant' },
+  { id: 'menu_tenant', parentId: 'menu_1', name: '租户管理', url: '/system/tenant', menuType: 1, sort: 11, icon: 'Building2', scope: 'platform' },
+  { id: 'menu_file', parentId: 'menu_1', name: '文件管理', url: '/system/file', menuType: 1, sort: 12, icon: 'FolderOpen', scope: 'tenant' },
+  { id: 'menu_region', parentId: 'menu_1', name: '区域管理', url: '/system/region', menuType: 1, sort: 13, icon: 'MapPin', scope: 'tenant' },
+  { id: 'menu_calendar', parentId: 'menu_1', name: '日程管理', url: '/system/calendar', menuType: 1, sort: 14, icon: 'CalendarDays', scope: 'tenant' },
+  { id: 'menu_log_login', parentId: 'menu_data', name: '登录日志', url: '/system/log/login', menuType: 1, sort: 2, icon: 'LogIn', scope: 'tenant' },
+  {
+    id: 'menu_log_operation',
+    parentId: 'menu_data',
+    name: '操作日志',
+    url: '/system/log/operation',
+    menuType: 1,
+    sort: 3,
+    icon: 'ScrollText',
+    scope: 'tenant'
+  },
+  { id: 'menu_ops_server', parentId: 'menu_ops', name: '服务监控', url: '/ops/server', menuType: 1, sort: 1, icon: 'Activity', scope: 'platform' },
+  { id: 'menu_ops_cache', parentId: 'menu_ops', name: '缓存监控', url: '/ops/cache', menuType: 1, sort: 2, icon: 'Database', scope: 'platform' },
+  { id: 'menu_ops_job', parentId: 'menu_ops', name: '定时任务', url: '/ops/job', menuType: 1, sort: 3, icon: 'Clock', scope: 'platform' },
+  { id: 'menu_ops_online', parentId: 'menu_ops', name: '在线用户', url: '/ops/online', menuType: 1, sort: 4, icon: 'Users', scope: 'platform' }
+]
+
+export class Migration1794240000000 implements MigrationInterface {
+  name = 'Migration1794240000000'
+
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    for (const menu of [...GROUPS, ...LEAVES]) {
+      await queryRunner.query(
+        'INSERT IGNORE INTO `sys_permission` ' +
+          '(`id`, `parent_id`, `name`, `url`, `is_route`, `menu_type`, `scope`, `perms_type`, `sort_no`, `always_show`, `icon`, `is_leaf`, `hidden`, `del_flag`, `rule_flag`, `status`, `internal_or_external`, `create_time`, `update_time`) ' +
+          "VALUES (?, ?, ?, ?, 1, ?, ?, '0', ?, 1, ?, 1, 0, 0, 0, '1', 0, NOW(), NOW())",
+        [menu.id, menu.parentId, menu.name, menu.url, menu.menuType, menu.scope, menu.sort, menu.icon]
+      )
+    }
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    const ids = [...GROUPS, ...LEAVES].map(menu => menu.id)
+    const placeholders = ids.map(() => '?').join(',')
+    await queryRunner.query(`DELETE FROM \`sys_permission\` WHERE \`id\` IN (${placeholders})`, ids)
+  }
+}

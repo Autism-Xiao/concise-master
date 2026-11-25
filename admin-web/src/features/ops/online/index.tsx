@@ -1,0 +1,226 @@
+import { useCallback, useMemo, useState } from 'react'
+import { LogOut, Search } from 'lucide-react'
+import { toast } from 'sonner'
+import { toastError } from '@/lib/toast-error'
+import type { ColumnDef } from '@tanstack/react-table'
+import { Button } from '@/components/ui/button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { Card, CardContent } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Skeleton } from '@/components/ui/skeleton'
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { DataTable, DataTableColumnHeader, DataTablePagination, DataTableViewOptions, useServerTable, type ServerTableQuery } from '@/components/data-table'
+import { hasPermission } from '@/lib/auth'
+import { toastBatchResult } from '@/lib/batch-delete'
+import { batchKickUsers, fetchOnlineUsers, formatDateTime, kickUser, type OnlineUser } from './api'
+
+const columnLabels: Record<string, string> = {
+  sessionId: '会话编号',
+  username: '登录账号',
+  dept: '所属部门',
+  ip: 'IP 地址',
+  location: '登录地点',
+  browser: '浏览器',
+  os: '操作系统',
+  loginTime: '登录时间',
+  expiresAt: '过期时间'
+}
+
+export function OnlineUsersPage() {
+  const [kicking, setKicking] = useState<OnlineUser | null>(null)
+  const [batchKicking, setBatchKicking] = useState(false)
+  const [batchBusy, setBatchBusy] = useState(false)
+
+  /** 服务端分页 + 搜索 */
+  const fetchPage = useCallback(({ page, pageSize, keyword }: ServerTableQuery<Record<string, never>>) => fetchOnlineUsers({ page, pageSize, keyword }), [])
+
+  const columns = useMemo<ColumnDef<OnlineUser>[]>(
+    () => [
+      {
+        accessorKey: 'sessionId',
+        header: '会话编号',
+        enableSorting: false,
+        cell: ({ row }) => (
+          <code className="text-muted-foreground text-xs" title={row.original.sessionId}>
+            {row.original.sessionId.slice(0, 8)}…
+          </code>
+        )
+      },
+      {
+        accessorKey: 'username',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="登录账号" />,
+        cell: ({ row }) => (
+          <span className="flex items-center gap-2 font-medium">
+            <span className="size-1.5 rounded-full bg-emerald-500" />
+            {row.original.username}
+          </span>
+        )
+      },
+      {
+        accessorKey: 'dept',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="所属部门" />,
+        cell: ({ row }) => row.original.dept || '-'
+      },
+      {
+        accessorKey: 'ip',
+        header: 'IP 地址',
+        cell: ({ row }) => <span className="tabular-nums">{row.original.ip || '-'}</span>
+      },
+      {
+        accessorKey: 'location',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="登录地点" />
+      },
+      {
+        accessorKey: 'browser',
+        header: '浏览器',
+        cell: ({ row }) => <span className="text-muted-foreground">{row.original.browser}</span>
+      },
+      {
+        accessorKey: 'os',
+        header: '操作系统',
+        cell: ({ row }) => <span className="text-muted-foreground">{row.original.os}</span>
+      },
+      {
+        accessorKey: 'loginTime',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="登录时间" />,
+        cell: ({ row }) => <span className="text-muted-foreground tabular-nums">{formatDateTime(row.original.loginTime)}</span>
+      },
+      {
+        accessorKey: 'expiresAt',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="过期时间" />,
+        cell: ({ row }) => <span className="text-muted-foreground tabular-nums">{formatDateTime(row.original.expiresAt)}</span>
+      },
+      {
+        id: 'actions',
+        header: () => <div className="text-end">操作</div>,
+        enableSorting: false,
+        enableHiding: false,
+        cell: ({ row }) =>
+          hasPermission('system:online:kick') ? (
+            <div className="flex items-center justify-end">
+              <Button variant="ghost" size="icon" onClick={() => setKicking(row.original)}>
+                <LogOut className="text-destructive size-4" />
+                <span className="sr-only">强制下线</span>
+              </Button>
+            </div>
+          ) : null
+      }
+    ],
+    []
+  )
+
+  const { table, keyword, setKeyword, loading, booted, error, total, reload, rowSelection, setRowSelection } = useServerTable({
+    columns,
+    query: fetchPage,
+    pageSize: 20,
+    getRowId: user => user.sessionId
+  })
+  const selectedCount = Object.keys(rowSelection).filter(key => rowSelection[key]).length
+
+  /** 批量强退：一次请求，后端逐条踢并返回失败原因（会话已过期的会出现在失败列表） */
+  const handleBatchKick = async () => {
+    const targets = table.getSelectedRowModel().rows.map(row => row.original)
+    if (!targets.length || batchBusy) return
+    setBatchBusy(true)
+    try {
+      const result = await batchKickUsers(targets.map(user => user.sessionId))
+      toastBatchResult(result, '会话')
+      setBatchKicking(false)
+      setRowSelection({})
+      reload()
+    } catch (e) {
+      toastError(e, '批量下线失败')
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
+  const handleKick = async () => {
+    if (!kicking) return
+    try {
+      await kickUser(kicking.sessionId)
+      toast.success(`已将「${kicking.username}」强制下线`)
+      setKicking(null)
+      reload()
+    } catch (e) {
+      toastError(e, '操作失败')
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">在线用户</h1>
+          <p className="text-muted-foreground text-sm">
+            当前共 {total >= 0 ? total : 0} 人在线（来自 Redis 实时会话，每页 {table.getState().pagination.pageSize} 个）
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {hasPermission('system:online:kick') && selectedCount > 0 && (
+            <Button variant="outline" onClick={() => setBatchKicking(true)} disabled={batchBusy}>
+              <LogOut />
+              批量下线（{selectedCount}）
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {!booted ? (
+        <Card>
+          <CardContent className="space-y-3 py-6">
+            <Skeleton className="h-9 w-full max-w-md" />
+            <Skeleton className="h-64 w-full" />
+          </CardContent>
+        </Card>
+      ) : error ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-3 py-12">
+            <p className="text-muted-foreground text-sm">{error}</p>
+            <Button variant="outline" onClick={reload}>
+              重试
+            </Button>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative w-full max-w-xs">
+                <Search className="text-muted-foreground absolute start-2.5 top-1/2 size-4 -translate-y-1/2" />
+                <Input placeholder="搜索账号 / 部门 / IP" className="ps-8" value={keyword} onChange={e => setKeyword(e.target.value)} />
+              </div>
+              <RefreshButton onClick={() => void reload()} className="ms-auto" />
+              <DataTableViewOptions table={table} columnLabels={columnLabels} />
+            </div>
+
+            <DataTable table={table} loading={loading} emptyText="没有匹配的在线用户" />
+            <DataTablePagination table={table} />
+          </CardContent>
+        </Card>
+      )}
+
+      <ConfirmDialog
+        confirmText="强制下线"
+        open={!!kicking}
+        onOpenChange={v => !v && setKicking(null)}
+        title="强制下线"
+        description={<>即将把「{kicking?.username}」踢下线，其令牌立即失效并需重新登录。</>}
+        onConfirm={handleKick}
+      />
+
+      <ConfirmDialog
+        confirmText="强制下线"
+        open={batchKicking}
+        onOpenChange={v => !batchBusy && setBatchKicking(v)}
+        title="批量强制下线"
+        description={
+          <>
+            即将让勾选的 {selectedCount} 个会话立即失效，对应用户需要重新登录。{batchBusy ? '正在处理，请稍候…' : ''}
+          </>
+        }
+        onConfirm={handleBatchKick}
+      />
+    </div>
+  )
+}

@@ -1,0 +1,75 @@
+import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common'
+import { Reflector } from '@nestjs/core'
+
+import { PERMS_KEY } from '../decorators/perms.decorator'
+import { PermissionCacheService } from '../../shared/permission-cache/permission-cache.service'
+import { TenantContext } from '../../shared/tenant/tenant.context'
+
+/**
+ * 全局按钮级权限守卫：读取 @Perms() 声明，校验用户是否持有该权限标识
+ *
+ * 权限集合来自 PermissionCacheService（按角色缓存 5 分钟 + 写侧主动失效）：
+ *  - 角色授权、角色删除、菜单权限改动都会立刻失效，改完权限下一次请求即生效；
+ *  - Redis 不可用时自动降级为实时查库，不影响鉴权正确性。
+ *
+ * 两条放行/拦截规则：
+ *  - **平台级权限**（sys_permission.scope='platform'，如 system:tenant:*、system:menu:*、运维监控）
+ *    除了持有权限码，还必须是平台管理员 —— 否则租户管理员给自己授个权就能建/删租户；
+ *  - 平台管理员（sys_user.is_platform_admin=1）拥有全部权限，与 RolesGuard 共用同一判定。
+ *
+ * 注意：这里**不再**按 role_code 判断超管。sys_role 是租户级表，按编码判定会把租户管理员提升成平台超管。
+ * 未声明 @Perms() 的接口不受限。
+ */
+@Injectable()
+export class PermsGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly permissionCache: PermissionCacheService
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const required = this.reflector.getAllAndOverride<string[]>(PERMS_KEY, [context.getHandler(), context.getClass()])
+    if (!required || required.length === 0) {
+      return true
+    }
+
+    const { user } = context.switchToHttp().getRequest()
+    const isPlatformAdmin = Number(user?.isPlatformAdmin ?? 0) === 1
+    const platformPerms = await this.permissionCache.getPlatformPerms()
+    const requiresPlatformPerm = required.some(perm => platformPerms.has(perm))
+
+    // 平台级权限前置拦截：先判作用域，再判是否持有（给租户管理员一个说得清的原因，而不是笼统的「无权限」）
+    if (!isPlatformAdmin && requiresPlatformPerm) {
+      const blocked = required.find(perm => platformPerms.has(perm)) as string
+      throw new ForbiddenException(`「${blocked}」是平台级权限，仅平台管理员可操作`)
+    }
+
+    // 强制两步验证：超管未绑定 2FA 时令牌带 mfaPending，平台级操作一律拦下
+    // （登录/浏览/绑定 2FA 不受影响，避免「必须绑 2FA 才能进系统、进系统才能绑 2FA」的死锁）
+    if (user?.mfaPending === true && requiresPlatformPerm) {
+      throw new ForbiddenException('平台账号需先绑定两步验证（右上角头像 → 安全设置）后才能执行该操作')
+    }
+
+    if (isPlatformAdmin) {
+      return true
+    }
+
+    const roles = user?.roles ?? []
+    if (roles.length === 0) {
+      throw new ForbiddenException('无操作权限')
+    }
+
+    const roleIds = roles.map((role: { id: string }) => role.id)
+    // 走缓存：角色 → sys_role_permission → sys_permission.perms（无效/已删除菜单不算数）
+    const owned = await this.permissionCache.getRolesPerms(roleIds)
+    // 租户套餐是接口级上限：角色授权 ∩ 套餐授权。只在前端隐藏菜单不够——
+    // 收窄/清空套餐后，旧 token 仍能直接调被收回模块的接口。
+    const tenantId = TenantContext.filterTenantId()
+    const packagePerms = tenantId !== null && tenantId > 0 ? await this.permissionCache.getTenantPerms(tenantId) : null
+
+    if (required.some(perm => owned.has(perm) && (packagePerms === null || packagePerms.has(perm)))) {
+      return true
+    }
+    throw new ForbiddenException('无操作权限')
+  }
+}

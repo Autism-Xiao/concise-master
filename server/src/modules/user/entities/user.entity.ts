@@ -1,0 +1,229 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger'
+import { Column, Entity, Index, JoinTable, ManyToMany, PrimaryColumn } from 'typeorm'
+import { RoleEntity } from '../../role/entities/role.entity'
+import { DeptEntity } from '../../system/dept/entities/dept.entity'
+import { PostEntity } from '../../system/post/entities/post.entity'
+import { LevelEntity } from '../../system/level/entities/level.entity'
+
+/**
+ * 用户表
+ * - 主键为 32 位字符串（非自增），由 randomId32() 生成
+ * - 密码为 argon2id（@node-rs/argon2）；历史数据仍是旧版 PBEWithMD5AndDES，
+ *   登录成功后自动透明升级，见 UserService.upgradePasswordHash
+ * - 全局 SnakeNamingStrategy 下驼峰属性自动映射下划线列名
+ * - 部门：多对多走 sys_user_depart；
+ *   主部门 = depart_ids 的第一个 id，其机构编码冗余到 org_code 供数据权限过滤
+ * - 索引（迁移 PerfIndexes1794230000000 建的，这里声明一遍是为了 migration:generate 不会把它们当孤儿删掉）：
+ *   (del_flag, create_time) —— 列表默认排序； (del_flag, realname) —— 姓名前缀搜索
+ */
+@Entity('sys_user')
+@Index('idx_user_del_create', ['delFlag', 'createTime'])
+@Index('idx_user_del_realname', ['delFlag', 'realname'])
+export class UserEntity {
+  @ApiProperty({ description: '主键ID（32位字符串）', example: 'e9ca23d68d884d4ebb19d07889727dae' })
+  @PrimaryColumn({ type: 'varchar', length: 32, comment: '主键id' })
+  id: string
+
+  @ApiProperty({ description: '登录账号', example: 'admin' })
+  @Column({ length: 100, unique: true, comment: '登录账号' })
+  username: string
+
+  @ApiProperty({ description: '真实姓名', example: '管理员' })
+  @Column({ length: 100, nullable: true, comment: '真实姓名' })
+  realname?: string
+
+  /** select: false —— 默认查询不带出密码与盐；任何接口响应都不返回 */
+  @ApiPropertyOptional({ description: '密码（argon2id PHC 串；历史数据为 16~48 位十六进制）', nullable: true })
+  @Column({ length: 255, select: false, comment: '密码' })
+  password?: string
+
+  @ApiPropertyOptional({ description: '历史密码盐（argon2id 自带盐，新数据为 null）', nullable: true })
+  // 显式写 type: 'varchar'：属性类型是 string | null 时 TypeORM 会推断成 Object 而拒绝建连
+  @Column({ type: 'varchar', length: 45, select: false, nullable: true, comment: 'md5密码盐' })
+  salt?: string | null
+
+  @ApiPropertyOptional({ description: '头像 URL', nullable: true })
+  // 显式 type：属性类型是 string | null 时 TypeORM 反射会推断成 Object 而拒绝建连（同 salt 列的坑）
+  @Column({ type: 'varchar', length: 255, nullable: true, comment: '头像' })
+  avatar?: string | null
+
+  @ApiPropertyOptional({ description: '生日', example: '1990-01-01', nullable: true })
+  @Column({ type: 'date', nullable: true, comment: '生日' })
+  birthday?: string
+
+  /** 个人简介（个人资料页可自助编辑，255 字符，纯展示字段） */
+  @Column({ type: 'varchar', length: 255, nullable: true, comment: '个人简介' })
+  bio?: string | null
+
+  @ApiPropertyOptional({ description: '性别：0 未知 / 1 男 / 2 女', example: 1, enum: [0, 1, 2], nullable: true })
+  @Column({ type: 'smallint', nullable: true, comment: '性别(0-默认未知,1-男,2-女)' })
+  sex?: number
+
+  @ApiPropertyOptional({ description: '电子邮件', nullable: true })
+  @Column({ length: 45, nullable: true, comment: '电子邮件' })
+  email?: string
+
+  @ApiPropertyOptional({ description: '电话', nullable: true })
+  @Column({ length: 45, nullable: true, comment: '电话' })
+  phone?: string
+
+  @ApiPropertyOptional({ description: '密码过期时间（空 = 不限制；过期后登录强制改密）', nullable: true })
+  @Column({ type: 'timestamp', nullable: true, comment: '密码过期时间(空=不限制)' })
+  passwordExpireAt?: Date | null
+  @ApiPropertyOptional({ description: '下次登录是否强制改密：1 是 / 0 否', example: 0, enum: [0, 1] })
+  @Column({ type: 'smallint', default: 0, comment: '下次登录强制改密(1是 0否)' })
+  mustChangePassword?: number
+
+  /**
+   * TOTP 密钥（base32，两步验证）
+   * select:false：任何列表/详情查询都不会带出密钥，只有显式 addSelect 的认证链路能读
+   * （登录门禁 / TotpService）。setup 时写入，activate 成功后生效，deactivate 清空。
+   */
+  @ApiPropertyOptional({ description: 'TOTP 密钥（base32，接口不下发）', nullable: true, example: '' })
+  @Column({ type: 'varchar', length: 64, nullable: true, select: false, name: 'totp_secret', comment: 'TOTP 密钥(base32, 两步验证)' })
+  totpSecret?: string | null
+  @ApiPropertyOptional({ description: '是否开启两步验证：1 开 / 0 关', example: 0, enum: [0, 1] })
+  @Column({ type: 'smallint', default: 0, name: 'totp_enabled', comment: '两步验证(1开 0关)' })
+  totpEnabled?: number
+
+  @ApiProperty({ description: '状态：1 正常 / 2 冻结（对齐 sys_user）', example: 1, enum: [1, 2] })
+  @Column({ type: 'smallint', nullable: true, comment: '状态(1-正常,2-冻结)' })
+  status: number
+
+  @ApiProperty({ description: '删除状态：0 正常 / 1 已删除（软删除）', example: 0, enum: [0, 1] })
+  @Column({ type: 'smallint', nullable: true, comment: '删除状态(0-正常,1-已删除)' })
+  delFlag: number
+
+  /**
+   * 平台管理员标志（多租户身份分层的唯一依据）
+   *
+   * 为什么不看 role_code：sys_role 是**租户级**表，任何租户都能建出 admin/superadmin 编码的角色，
+   * 按编码判定等于把「租户管理员」直接提升成「平台超管」（可切任意租户、可看全库）。
+   * 这里用显式标志位，只有平台运营账号为 1。
+   */
+  @ApiProperty({ description: '是否平台管理员：1 是 / 0 否（跨租户视角与平台级权限的唯一依据）', example: 0, enum: [0, 1] })
+  @Column({ type: 'smallint', default: 0, name: 'is_platform_admin', comment: '是否平台管理员(1是 0否)' })
+  isPlatformAdmin: number
+
+  /**
+   * 是否租户管理员（至少一个租户绑定了 admin 角色）
+   *
+   * 与 is_platform_admin 的区别：
+   * - 平台管理员是账号属性，跨租户视角由 TenantContext 决定；
+   * - 租户管理员是派生状态，由 sys_user_role ⋈ sys_role(role_code='admin', tenant_id>0) 算出，
+   *   写路径（授予/移除角色、移出租户）同步维护。
+   *
+   * 作用：兜底防租户锁死（误删最后一个管理员时仍能识别）+ 前端快速标注，不作为鉴权唯一依据。
+   */
+  @ApiProperty({ description: '是否租户管理员：1 是 / 0 否（至少在一个租户持有 admin 角色）', example: 0, enum: [0, 1] })
+  @Column({ type: 'smallint', default: 0, name: 'is_tenant_admin', comment: '是否租户管理员(1是 0否)' })
+  isTenantAdmin: number
+
+  @ApiPropertyOptional({ description: '会员等级：0 普通 / 1 VIP（VIP 可自助开通租户）', example: 0, enum: [0, 1] })
+  @Column({ type: 'smallint', default: 0, name: 'vip_level', comment: '会员等级(0普通 1VIP)' })
+  vipLevel?: number
+
+  @ApiPropertyOptional({ description: 'VIP 到期时间（空 = 永久；过期只影响新开通租户，不回收已开的）', nullable: true })
+  @Column({ type: 'timestamp', nullable: true, name: 'vip_expire_at', comment: 'VIP到期时间(空=永久)' })
+  vipExpireAt?: Date | null
+
+  @ApiPropertyOptional({ description: '工号（唯一）', example: '00001', nullable: true })
+  @Column({ length: 100, nullable: true, unique: true, comment: '工号，唯一键' })
+  workNo?: string
+
+  @ApiPropertyOptional({ description: '座机号', nullable: true })
+  @Column({ length: 45, nullable: true, comment: '座机号' })
+  telephone?: string
+
+  @ApiPropertyOptional({ description: '创建人', nullable: true })
+  @Column({ length: 32, nullable: true, comment: '创建人' })
+  createBy?: string
+
+  @ApiProperty({ description: '创建时间' })
+  @Column({ type: 'timestamp', nullable: true, comment: '创建时间' })
+  createTime?: Date
+
+  @ApiPropertyOptional({ description: '更新人', nullable: true })
+  @Column({ length: 32, nullable: true, comment: '更新人' })
+  updateBy?: string
+
+  @ApiProperty({ description: '更新时间' })
+  @Column({ type: 'timestamp', nullable: true, comment: '更新时间' })
+  updateTime?: Date
+
+  @ApiProperty({ description: '角色列表', type: [RoleEntity], required: false })
+  @ManyToMany(() => RoleEntity, role => role.users)
+  @JoinTable({
+    name: 'sys_user_role',
+    joinColumns: [{ name: 'user_id', referencedColumnName: 'id' }],
+    inverseJoinColumns: [{ name: 'role_id', referencedColumnName: 'id' }]
+  })
+  roles: RoleEntity[]
+
+  @ApiPropertyOptional({ description: '所属机构编码（主部门 org_code 冗余，用于数据权限过滤）', example: 'A01', nullable: true })
+  @Column({ type: 'varchar', length: 64, nullable: true, comment: '登录会话的机构编码' })
+  orgCode?: string | null
+
+  @ApiPropertyOptional({
+    description: '所属部门 ID 集合（逗号分隔，顺序即主次，首个为主部门）',
+    example: 'dept_1,dept_2',
+    nullable: true
+  })
+  @Column({ type: 'varchar', length: 1000, nullable: true, comment: '所属部门id集合' })
+  departIds?: string | null
+
+  @ApiProperty({ description: '所属部门列表（sys_user_depart 多对多）', type: [DeptEntity], required: false })
+  @ManyToMany(() => DeptEntity, dept => dept.users)
+  @JoinTable({
+    name: 'sys_user_depart',
+    joinColumns: [{ name: 'user_id', referencedColumnName: 'id' }],
+    inverseJoinColumns: [{ name: 'dep_id', referencedColumnName: 'id' }]
+  })
+  depts?: DeptEntity[]
+
+  /**
+   * 主部门（= depts[0]），非数据库列，由 UserService 组装
+   * 保留该字段是为了兼容旧前端/旧接口里单个 dept 的返回结构
+   */
+  @ApiPropertyOptional({ description: '主部门（部门列表第一个元素，兼容字段）', type: DeptEntity, required: false })
+  dept?: DeptEntity | null
+
+  /**
+   * 主部门 ID（= dept.id），非数据库列，由 UserService 组装
+   * 旧接口/旧前端读的是 user.deptId，这里保留只读兼容；写入请用 depts / deptIds
+   */
+  @ApiPropertyOptional({ description: '主部门 ID（兼容旧字段，等价于 dept.id），只读', example: 'dept_1', deprecated: true })
+  deptId?: string | null
+
+  @ApiPropertyOptional({ description: '岗位列表（sys_user_post 多对多）', type: [PostEntity], required: false })
+  @ManyToMany(() => PostEntity, post => post.users)
+  @JoinTable({
+    name: 'sys_user_post',
+    joinColumns: [{ name: 'user_id', referencedColumnName: 'id' }],
+    inverseJoinColumns: [{ name: 'post_id', referencedColumnName: 'id' }]
+  })
+  posts?: PostEntity[]
+
+  @ApiPropertyOptional({ description: '职级ID（sys_level 主键，一人一个职级，可空）', example: 'lvl_3' })
+  @Column({ type: 'varchar', length: 32, nullable: true, comment: '职级ID(sys_level)' })
+  levelId?: string | null
+
+  /** 职级（非数据库列，列表/详情由 UserService 批量组装，只取 id/levelName 避免带出大对象） */
+  @ApiPropertyOptional({ description: '职级（levelId 对应的 sys_level，只读）', nullable: true })
+  level?: Pick<LevelEntity, 'id' | 'levelName'> | null
+
+  /**
+   * 水印开关原始值（非数据库列，列表/详情由 UserService 批量组装）
+   * null 表示未单独设置、继承全局默认；1 开 / 0 关
+   */
+  @ApiPropertyOptional({ description: '水印开关原始值：1 开 / 0 关 / null 继承全局，只读', nullable: true, enum: [0, 1] })
+  watermarkEnabled?: number | null
+
+  /** 强管控档（非数据库列）：0 不强制 / 1 强制开 / 2 强制关 */
+  @ApiPropertyOptional({ description: '水印强管控：0 不强制 / 1 强制开 / 2 强制关，只读', example: 0, enum: [0, 1, 2] })
+  watermarkEnforced?: number
+
+  /** 最终生效结果（非数据库列）：已合并全局策略与强管控，前端据此显示"实际是否带水印" */
+  @ApiPropertyOptional({ description: '水印最终是否生效，只读', example: true })
+  watermarkEffective?: boolean
+}

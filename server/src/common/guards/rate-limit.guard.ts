@@ -1,0 +1,77 @@
+import { CanActivate, ExecutionContext, HttpStatus, Injectable } from '@nestjs/common'
+import { Reflector } from '@nestjs/core'
+
+import { BizErrorCode } from '../enums/biz-error-code.enum'
+import { BizException } from '../exceptions/biz.exception'
+import { RATE_LIMIT_KEY, type RateLimitOptions } from '../decorators/rate-limit.decorator'
+import { envBoolean, envNumber } from '../../global/env'
+import { TenantContext } from '../../shared/tenant/tenant.context'
+import { RateLimitService } from '../../shared/rate-limit/rate-limit.service'
+import { buildRateLimitKey } from './rate-limit-key'
+
+/** 全局默认阈值：单 IP 单接口 120 次/分钟（正常后台操作远低于此，突发刷新也不会误伤） */
+const DEFAULT_LIMIT = 120
+const DEFAULT_WINDOW = 60
+
+interface RequestLike {
+  ip?: string
+  method?: string
+  route?: { path?: string }
+  originalUrl?: string
+  url?: string
+  body?: Record<string, unknown>
+  /** JwtAuthGuard 在本守卫之后注册，大多数请求到这里还没鉴权；改密等已登录接口会带 user */
+  user?: { id?: string; username?: string }
+}
+
+/**
+ * 全局限流守卫（APP_GUARD，注册在 JwtAuthGuard 之前）
+ *
+ * 为什么放在认证之前：未登录的暴力请求同样消耗连接与 CPU，先限流再鉴权更省资源。
+ * 为什么自己写而不引 @nestjs/throttler：登录失败锁定需要「按账号累计失败次数」，
+ * 与本守卫共用同一计数器（Redis / 内存双后端）比再引一层依赖更直接，也能精确控制文案与状态码。
+ *
+ * 降级策略：Redis 不可用时 RateLimitService 自动退回进程内计数，限流永远不成为故障点。
+ */
+@Injectable()
+export class RateLimitGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly rateLimitService: RateLimitService
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    if (!envBoolean('RATE_LIMIT_ENABLED', true)) {
+      return true
+    }
+
+    const options = this.reflector.getAllAndOverride<RateLimitOptions | undefined>(RATE_LIMIT_KEY, [context.getHandler(), context.getClass()])
+    // 全局维度可用 RATE_LIMIT_BY=tenant 切换；account 维度在 JWT 前拿不到用户，不开放为全局默认
+    const globalBy = process.env.RATE_LIMIT_BY?.trim().toLowerCase() === 'tenant' ? 'tenant' : 'ip'
+    const by = options?.by ?? globalBy
+    const limit = options?.limit ?? envNumber('RATE_LIMIT_LIMIT', DEFAULT_LIMIT)
+    const windowSeconds = options?.window ?? envNumber('RATE_LIMIT_WINDOW', DEFAULT_WINDOW)
+    if (limit <= 0) {
+      return true
+    }
+
+    const request = context.switchToHttp().getRequest<RequestLike>()
+    const ip = (request.ip ?? 'unknown').replace(/^::ffff:/, '')
+    // 路由模板（/v1/users/:id）而非原始 URL，避免 id 不同就被算成不同桶
+    const route = `${request.method ?? 'GET'} ${request.route?.path ?? request.originalUrl ?? request.url ?? ''}`
+    // account 维度：已登录请求用 req.user（改密等接口 body 里没有 username），
+    // 未登录的登录接口回退到 body.username
+    const bodyAccount = typeof request.body?.username === 'string' ? request.body.username : ''
+    const rawAccount = request.user?.username ?? request.user?.id ?? bodyAccount
+    const account = by === 'account' && typeof rawAccount === 'string' && rawAccount ? rawAccount.trim().toLowerCase() : ''
+    // TenantMiddleware 早于所有 Guard，这里一定有上下文；匿名为 0、平台视角为 null，都回退 IP 维度
+    const key = buildRateLimitKey({ route, ip, account, tenantId: TenantContext.filterTenantId(), by })
+
+    const hit = await this.rateLimitService.increment(key, windowSeconds)
+    if (hit.count > limit) {
+      const retryAfter = Math.max(Math.ceil((hit.resetAt - Date.now()) / 1000), 1)
+      throw new BizException(BizErrorCode.RATE_LIMITED, options?.message ?? `请求过于频繁，请 ${retryAfter} 秒后再试`, HttpStatus.TOO_MANY_REQUESTS)
+    }
+    return true
+  }
+}

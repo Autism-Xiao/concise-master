@@ -1,0 +1,407 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+@import '@fontsource-variable/inter';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+  /* 品牌标识：随明暗主题变化；自定义主题色可在 settings-provider 覆盖这几项 */
+  --logo-bg-from: #1b8a4c;
+  --logo-bg-to: #4dbb78;
+  --logo-arc: #e8f7ef;
+  --logo-dot: #ffffff;
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+  /* 深色下提亮渐变与弧线，避免墨绿底在深灰背景里糊成一块 */
+  --logo-bg-from: #2f9e63;
+  --logo-bg-to: #70d6a1;
+  --logo-arc: #f1fbf5;
+  --logo-dot: #ffffff;
+}
+
+@theme inline {
+  --font-sans: 'Inter Variable', system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  html {
+    @apply font-sans;
+  }
+  /* 字体大小切换时平滑过渡，避免整页 rem 布局瞬间跳变闪烁 */
+  html.font-size-transition {
+    transition: font-size 0.2s ease-in-out;
+  }
+}
+
+/* 主题切换：左上角 → 右下角 扫光过渡 */
+::view-transition-old(root) {
+  animation: none;
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 9999;
+  animation: theme-sweep 0.6s ease-in-out both;
+}
+
+/* 用户开启减少动态效果时，不播放扫光动画 */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}
+
+@keyframes theme-sweep {
+  from {
+    clip-path: polygon(0 0, 0 0, 0 0);
+  }
+  to {
+    clip-path: polygon(0 0, 210% 0, 0 210%);
+  }
+}
+
+/* ---------- 表格固定操作列（sticky right） ----------
+ * 列多的表格会横向滚动，操作按钮原本会跟着滚出视野；这一层把「操作」列贴在右边缘。
+ * 必须自己给背景色：sticky 单元格不设背景时，滚动内容会从它下面透出来。
+ * 背景取 --card（表格都在 Card 里），hover / 选中态手动对齐 tr 的底色，否则操作列不跟着高亮。
+ */
+.table-sticky-action {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background-color: var(--card);
+  /* 左侧渐隐投影，提示「这一列浮在内容之上」 */
+  box-shadow: -8px 0 10px -8px rgb(0 0 0 / 0.18);
+}
+
+tr:hover > .table-sticky-action {
+  background-color: color-mix(in oklab, var(--muted) 50%, var(--card));
+}
+
+tr[data-state='selected'] > .table-sticky-action {
+  background-color: var(--muted);
+}
+
+/* 弹窗 / 抽屉里的表格背景是 --popover，不是 --card，单独一套底色 */
+.table-sticky-action-popover {
+  background-color: var(--popover);
+}
+
+tr:hover > .table-sticky-action-popover {
+  background-color: color-mix(in oklab, var(--muted) 50%, var(--popover));
+}
+
+/* 状态标签呼吸灯：只给「活的」状态用（运行中 / 在线 / 进行中），静态终态不加 */
+@keyframes status-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.animate-status-breathe {
+  animation: status-breathe 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-status-breathe {
+    animation: none;
+  }
+}
+
+/* 登录页品牌面板装饰光斑：缓慢上下漂浮 */
+@keyframes login-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-16px);
+  }
+}
+
+.animate-login-float {
+  animation: login-float 8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-login-float {
+    animation: none;
+  }
+}
+
+/* 侧边栏子菜单展开/收起高度动画（Base UI Collapsible：高度变量 + 过渡） */
+.CollapsibleContent {
+  height: var(--collapsible-panel-height);
+  overflow: hidden;
+  transition: height 300ms ease-out;
+}
+
+.CollapsibleContent[data-starting-style],
+.CollapsibleContent[data-ending-style] {
+  height: 0;
+}
+
+/* 侧边栏与任意 data-scroll 容器（main/tabs/dialog/tree…）：细窄滚动条，默认透明，鼠标进入滚动区域时显现。
+   注意：main 值被 tenant-scope-provider / watermark 用 main[data-scroll="main"] 查询，勿改名。 */
+[data-sidebar='content'],
+[data-scroll] {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+[data-sidebar='content']:hover,
+[data-scroll]:hover {
+  scrollbar-color: color-mix(in oklch, var(--muted-foreground) 35%, transparent) transparent;
+}
+[data-sidebar='content']::-webkit-scrollbar,
+[data-scroll]::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+[data-sidebar='content']::-webkit-scrollbar-track,
+[data-scroll]::-webkit-scrollbar-track {
+  background: transparent;
+}
+[data-sidebar='content']::-webkit-scrollbar-thumb,
+[data-scroll]::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+}
+[data-sidebar='content']:hover::-webkit-scrollbar-thumb,
+[data-scroll]:hover::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--muted-foreground) 35%, transparent);
+}
+[data-sidebar='content']::-webkit-scrollbar-thumb:hover,
+[data-scroll]::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklch, var(--muted-foreground) 55%, transparent);
+}
+
+/* ---------- 登录页滑动验证码（rc-slider-captcha）视觉对齐设计系统 ----------
+ * 颜色 / 圆角 / 高度由 features/auth/login.tsx 通过 --rcsc-* 变量注入
+ * （胶囊滑轨 999px + 实心主题色滑块），这里只处理变量覆盖不到的细节：
+ * 渐变进度填充、阴影、图标按钮、悬停/错误动效。
+ * 尺寸保持 320x160 与后端出图一致，缩放会让 x 轴校验错位，切勿改动。
+ */
+.captcha-slider {
+  /* 固定 320px 与后端出图一致，居中与表单列对齐 */
+  margin-inline: auto;
+}
+
+.captcha-slider .rc-slider-captcha-panel {
+  padding-bottom: 12px;
+}
+
+/* 图片区：极淡描边 + 柔和投影
+ * 原来用 var(--border)（深色下是 10% 白）1px 实线，在深色弹窗上会形成一圈明显的「白框」，
+ * 图片像是被贴了个相框；这里按前景色取 6%，只保留"图片到边缘"的过渡，不抢画面。
+ */
+.captcha-slider .rc-slider-captcha-panel-inner {
+  border: 1px solid color-mix(in oklab, var(--foreground) 6%, transparent);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.06);
+}
+
+/* 右上角刷新：毛玻璃圆形按钮，替代默认的裸白色图标 */
+.captcha-slider .rc-slider-captcha-jigsaw-refresh {
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  background-color: rgb(0 0 0 / 0.38);
+  backdrop-filter: blur(4px);
+  font-size: 14px;
+  opacity: 1;
+  transition: background-color 0.2s ease;
+}
+
+.captcha-slider .rc-slider-captcha-jigsaw-refresh:hover {
+  background-color: rgb(0 0 0 / 0.55);
+}
+
+/* 滑块：实心色块 + 贴手阴影，去掉默认的硬描边 */
+.captcha-slider .rc-slider-captcha-button {
+  border: none;
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 0.18),
+    0 0 0 1px rgb(0 0 0 / 0.04);
+  font-size: 18px;
+  transition:
+    background-color 0.2s ease,
+    box-shadow 0.2s ease,
+    filter 0.2s ease;
+}
+
+/* 悬停轻微提亮，暗示「可拖动」 */
+.captcha-slider .rc-slider-captcha-button-pc:hover {
+  filter: brightness(1.06);
+  box-shadow: 0 2px 6px rgb(0 0 0 / 0.2);
+}
+
+/* 拖动 / 验证中 / 成功 / 失败：语义色块保持浮起 */
+.captcha-slider .rc-slider-captcha-button-active,
+.captcha-slider .rc-slider-captcha-button-verify,
+.captcha-slider .rc-slider-captcha-button-success,
+.captcha-slider .rc-slider-captcha-button-error,
+.captcha-slider .rc-slider-captcha-button:active {
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.22);
+}
+
+/* 进度填充：主题色由浅到深的横向渐变，替代默认的平铺浅色块 + 描边 */
+.captcha-slider .rc-slider-captcha-control-indicator {
+  border-color: transparent;
+  background: linear-gradient(90deg, color-mix(in oklab, var(--primary) 14%, transparent), color-mix(in oklab, var(--primary) 32%, transparent));
+}
+
+/* 成功 / 失败：跟随语义色做同款渐变 */
+.captcha-slider .rc-slider-captcha-control-success .rc-slider-captcha-control-indicator {
+  border-color: transparent;
+  background: linear-gradient(90deg, color-mix(in oklab, var(--rcsc-success) 14%, transparent), color-mix(in oklab, var(--rcsc-success) 32%, transparent));
+}
+
+.captcha-slider .rc-slider-captcha-control-error .rc-slider-captcha-control-indicator {
+  border-color: transparent;
+  background: linear-gradient(90deg, color-mix(in oklab, var(--rcsc-error) 12%, transparent), color-mix(in oklab, var(--rcsc-error) 30%, transparent));
+}
+
+/* 失败抖动：整条滑轨小幅左右摇晃，明确「没通过」 */
+@keyframes captcha-shake {
+  20% {
+    transform: translateX(-3px);
+  }
+  40% {
+    transform: translateX(3px);
+  }
+  60% {
+    transform: translateX(-2px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+.captcha-slider .rc-slider-captcha-control-error {
+  animation: captcha-shake 0.4s ease;
+}
+
+/* 提示文案：小一号 + 轻字距，居中悬浮在滑轨上 */
+.captcha-slider .rc-slider-captcha-control-tips {
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}

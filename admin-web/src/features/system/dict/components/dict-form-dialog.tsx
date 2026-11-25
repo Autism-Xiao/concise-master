@@ -1,0 +1,107 @@
+import { useState } from 'react'
+import { AppFormDialog } from '@/components/app-form-dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { FieldError, maxLength, requiredWith, sysCode, useFieldErrors } from '@/lib/form-validation'
+import type { Dict, DictFormValues } from '../api'
+
+interface DictFormDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  /** null 表示新增 */
+  dict: Dict | null
+  onSubmit: (values: DictFormValues) => Promise<void>
+}
+
+const TYPE_LABELS: Record<string, string> = { '0': '字符串（string）', '1': '数字（number）' }
+
+/** 由父组件按 key 控制重挂载，保证打开时表单初始化为对应字典 */
+export function DictFormDialog({ open, onOpenChange, dict, onSubmit }: DictFormDialogProps) {
+  const [form, setForm] = useState<DictFormValues>(() => ({
+    dictName: dict?.dictName ?? '',
+    dictCode: dict?.dictCode ?? '',
+    type: dict?.type ?? 0,
+    description: dict?.description ?? ''
+  }))
+  const [submitting, setSubmitting] = useState(false)
+  const { errors, runValidation, clearError } = useFieldErrors()
+
+  const set = <K extends keyof DictFormValues>(key: K, value: DictFormValues[K]) => {
+    setForm(prev => ({ ...prev, [key]: value }))
+    clearError(key as string)
+  }
+
+  const handleSubmit = async () => {
+    if (
+      !runValidation(
+        {
+          dictName: [requiredWith('字典名称', maxLength(100, '字典名称'))],
+          dictCode: [requiredWith('字典编码', sysCode, maxLength(100, '字典编码'))]
+        },
+        form
+      )
+    )
+      return
+    setSubmitting(true)
+    try {
+      await onSubmit({ ...form, description: form.description?.trim() || undefined })
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <AppFormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={dict ? '编辑字典' : '新增字典'}
+      description={dict ? '修改字典信息后保存' : '字典创建后可继续为它添加字典项'}
+      formId="dict-form"
+      onSubmit={handleSubmit}
+      submitting={submitting}
+    >
+      <div className="space-y-2">
+        <Label htmlFor="dict-name">字典名称</Label>
+        <Input
+          id="dict-name"
+          value={form.dictName}
+          onChange={e => set('dictName', e.target.value)}
+          placeholder="如 用户性别"
+          maxLength={100}
+          aria-invalid={!!errors.dictName}
+        />
+        <FieldError message={errors.dictName} />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="dict-code">字典编码</Label>
+        <Input
+          id="dict-code"
+          value={form.dictCode}
+          onChange={e => set('dictCode', e.target.value)}
+          placeholder="如 sys_user_gender"
+          maxLength={100}
+          aria-invalid={!!errors.dictCode}
+        />
+        <FieldError message={errors.dictCode} />
+        <p className="text-muted-foreground text-xs">唯一标识，字母开头，前端按此编码取字典项</p>
+      </div>
+      <div className="space-y-2">
+        <Label>值类型</Label>
+        <Select value={String(form.type)} onValueChange={v => set('type', Number(v))} items={TYPE_LABELS}>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="0">字符串（string）</SelectItem>
+            <SelectItem value="1">数字（number）</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="dict-description">描述</Label>
+        <Input id="dict-description" value={form.description ?? ''} onChange={e => set('description', e.target.value)} maxLength={255} />
+      </div>
+    </AppFormDialog>
+  )
+}

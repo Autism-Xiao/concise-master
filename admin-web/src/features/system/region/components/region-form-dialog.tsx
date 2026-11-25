@@ -1,0 +1,323 @@
+import { useEffect, useState } from 'react'
+import { toast } from 'sonner'
+import { toastError } from '@/lib/toast-error'
+import { AppFormDialog } from '@/components/app-form-dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
+import { createRegion, fetchRegionByCode, fetchRegionChildren, updateRegion, type Region } from '../api'
+import { areaCode as areaCodeRule, FieldError, maxLength, numberRange, optional, pattern, requiredWith, useFieldErrors } from '@/lib/form-validation'
+
+interface RegionFormDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  /** null 表示新增 */
+  region: Region | null
+  /** 保存成功后回调（父页面刷新列表） */
+  onSaved: () => void
+}
+
+const LEVEL_TEXTS = ['省份', '城市', '区县', '街道']
+
+/** 由父组件按 key 控制重挂载，保证打开时表单初始化为对应区划 */
+export function RegionFormDialog({ open, onOpenChange, region, onSaved }: RegionFormDialogProps) {
+  const [name, setName] = useState(region?.name ?? '')
+  const [shortName, setShortName] = useState(region?.shortName ?? '')
+  const [fullName, setFullName] = useState(region?.fullName ?? '')
+  const [areaCode, setAreaCode] = useState(region?.areaCode ?? '')
+  const [cityCode, setCityCode] = useState(region?.cityCode ?? '')
+  const [zipCode, setZipCode] = useState(region?.zipCode ?? '')
+  const [pinyin, setPinyin] = useState(region?.pinyin ?? '')
+  const [lng, setLng] = useState(region?.lng ?? '')
+  const [lat, setLat] = useState(region?.lat ?? '')
+
+  // 级联选上级：选到哪一级，上级就是哪级（都不选 = 顶级省份）
+  const [provinces, setProvinces] = useState<Region[] | null>(null)
+  const [cities, setCities] = useState<Region[]>([])
+  const [districts, setDistricts] = useState<Region[]>([])
+  const [parentProvince, setParentProvince] = useState('')
+  const [parentCity, setParentCity] = useState('')
+  const [parentDistrict, setParentDistrict] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetchRegionChildren('0')
+      .then(setProvinces)
+      .catch(e => toastError(e, '加载省级区划失败'))
+  }, [])
+
+  // 编辑时按 parentCode 反查祖先链，回填级联选择
+  useEffect(() => {
+    if (!region || region.parentCode === '0') return
+    let cancelled = false
+    ;(async () => {
+      try {
+        let current = await fetchRegionByCode(region.parentCode)
+        const chain: Region[] = [current]
+        while (chain.length < 3 && current.parentCode !== '0') {
+          current = await fetchRegionByCode(current.parentCode)
+          chain.unshift(current)
+        }
+        if (cancelled) return
+        if (chain[0]) setParentProvince(chain[0].areaCode)
+        if (chain[1]) setParentCity(chain[1].areaCode)
+        if (chain[2]) setParentDistrict(chain[2].areaCode)
+      } catch (e) {
+        if (!cancelled) toastError(e, '回填上级区划失败')
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [region])
+
+  // 级联懒加载：effect 只负责拉数据，「清空下级选择」放在 onChange 里，避免编辑回填被清掉
+  useEffect(() => {
+    if (!parentProvince) {
+      setCities([])
+      return
+    }
+    fetchRegionChildren(parentProvince)
+      .then(setCities)
+      .catch(() => setCities([]))
+  }, [parentProvince])
+
+  useEffect(() => {
+    if (!parentCity) {
+      setDistricts([])
+      return
+    }
+    fetchRegionChildren(parentCity)
+      .then(setDistricts)
+      .catch(() => setDistricts([]))
+  }, [parentCity])
+
+  const handleProvinceChange = (code: string) => {
+    setParentProvince(code)
+    setParentCity('')
+    setParentDistrict('')
+    setCities([])
+    setDistricts([])
+  }
+
+  const handleCityChange = (code: string) => {
+    setParentCity(code)
+    setParentDistrict('')
+    setDistricts([])
+  }
+
+  /** 级联深度即层级：0 省 / 1 市 / 2 区县 / 3 街道 */
+  const level = parentDistrict ? 3 : parentCity ? 2 : parentProvince ? 1 : 0
+  const parentCode = parentDistrict || parentCity || parentProvince || '0'
+  const isEdit = !!region
+  const { errors, runValidation, clearError } = useFieldErrors()
+
+  /** 零散 state 统一走这里改：写入时顺手清掉该字段的错误提示 */
+  const setField = (setter: (v: string) => void, key: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    setter(e.target.value)
+    clearError(key)
+  }
+
+  const handleSubmit = async () => {
+    // 名称必填；区划代码 12 位数字；邮编 6 位；经纬度是有理数；拼音/城市代码只做长度与字符约束
+    if (
+      !runValidation(
+        {
+          name: [requiredWith('名称', maxLength(100, '名称'))],
+          areaCode: [requiredWith('区划代码', areaCodeRule)],
+          shortName: [optional(maxLength(100, '简称'))],
+          pinyin: [optional(pattern(/^[A-Za-z\s]*$/, '拼音只能包含英文字母'), maxLength(100, '拼音'))],
+          cityCode: [optional(pattern(/^\d{0,4}$/, '城市代码须为数字区号'), maxLength(4, '城市代码'))],
+          zipCode: [optional(pattern(/^\d{6}$/, '邮编须为 6 位数字'))],
+          lng: [optional(numberRange(-180, 180, '经度'))],
+          lat: [optional(numberRange(-90, 90, '纬度'))]
+        },
+        { name, areaCode, shortName, pinyin, cityCode, zipCode, lng, lat }
+      )
+    )
+      return
+    setSaving(true)
+    try {
+      const payload = {
+        name: name.trim(),
+        areaCode: areaCode.trim(),
+        parentCode,
+        level,
+        shortName: shortName.trim() || undefined,
+        fullName: fullName.trim() || undefined,
+        pinyin: pinyin.trim() || undefined,
+        cityCode: cityCode.trim() || undefined,
+        zipCode: zipCode.trim() || undefined,
+        lng: lng.trim() || undefined,
+        lat: lat.trim() || undefined
+      }
+      if (isEdit && region) {
+        await updateRegion(region.id, payload)
+        toast.success('区划已更新')
+      } else {
+        await createRegion(payload)
+        toast.success('区划已创建')
+      }
+      onOpenChange(false)
+      onSaved()
+    } catch (err) {
+      toastError(err, '保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const provinceItems: Record<string, string> = { '': '顶级（新增省级）', ...Object.fromEntries((provinces ?? []).map(p => [p.areaCode, p.name])) }
+
+  return (
+    <AppFormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={isEdit ? '编辑区划' : '新增区划'}
+      description={
+        <>
+          层级由上级决定：{LEVEL_TEXTS[level]}
+          {isEdit ? '（编辑时可整体换上级，下级区划会一并跟着移动）' : ''}
+        </>
+      }
+      size="lg"
+      contentClassName="max-h-[88vh]"
+      formId="region-form"
+      onSubmit={handleSubmit}
+      submitting={saving}
+    >
+      <div className="space-y-2">
+        <Label>上级区划（逐级选择，选到哪级上级就是哪级）</Label>
+        {provinces === null ? (
+          <Skeleton className="h-9 w-full" />
+        ) : (
+          <div className="grid grid-cols-3 gap-2">
+            <Select value={parentProvince} onValueChange={handleProvinceChange} items={provinceItems}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="">顶级（新增省级）</SelectItem>
+                {provinces.map(p => (
+                  <SelectItem key={p.areaCode} value={p.areaCode}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {parentProvince && (
+              <Select value={parentCity} onValueChange={handleCityChange} items={Object.fromEntries(cities.map(c => [c.areaCode, c.name]))}>
+                <SelectTrigger>
+                  <SelectValue placeholder="选择城市" />
+                </SelectTrigger>
+                <SelectContent>
+                  {cities.map(c => (
+                    <SelectItem key={c.areaCode} value={c.areaCode}>
+                      {c.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            {parentCity && (
+              <Select value={parentDistrict} onValueChange={setParentDistrict} items={Object.fromEntries(districts.map(d => [d.areaCode, d.name]))}>
+                <SelectTrigger>
+                  <SelectValue placeholder="选择区县" />
+                </SelectTrigger>
+                <SelectContent>
+                  {districts.map(d => (
+                    <SelectItem key={d.areaCode} value={d.areaCode}>
+                      {d.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="region-name">名称</Label>
+          <Input id="region-name" value={name} onChange={setField(setName, 'name')} placeholder="如 深圳市" maxLength={100} aria-invalid={!!errors.name} />
+          <FieldError message={errors.name} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-short">简称</Label>
+          <Input
+            id="region-short"
+            value={shortName}
+            onChange={setField(setShortName, 'shortName')}
+            placeholder="如 深圳"
+            maxLength={100}
+            aria-invalid={!!errors.shortName}
+          />
+          <FieldError message={errors.shortName} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-code">区划代码</Label>
+          <Input
+            id="region-code"
+            value={areaCode}
+            onChange={setField(setAreaCode, 'areaCode')}
+            placeholder="如 440300000000"
+            maxLength={12}
+            aria-invalid={!!errors.areaCode}
+          />
+          <FieldError message={errors.areaCode} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-pinyin">拼音</Label>
+          <Input
+            id="region-pinyin"
+            value={pinyin}
+            onChange={setField(setPinyin, 'pinyin')}
+            placeholder="如 ShenZhen"
+            maxLength={100}
+            aria-invalid={!!errors.pinyin}
+          />
+          <FieldError message={errors.pinyin} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-citycode">城市代码（电话区号）</Label>
+          <Input
+            id="region-citycode"
+            value={cityCode}
+            onChange={setField(setCityCode, 'cityCode')}
+            placeholder="如 0755"
+            maxLength={4}
+            aria-invalid={!!errors.cityCode}
+          />
+          <FieldError message={errors.cityCode} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-zip">邮编</Label>
+          <Input
+            id="region-zip"
+            value={zipCode}
+            onChange={setField(setZipCode, 'zipCode')}
+            placeholder="如 518000"
+            maxLength={6}
+            aria-invalid={!!errors.zipCode}
+          />
+          <FieldError message={errors.zipCode} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-lng">经度</Label>
+          <Input id="region-lng" value={lng} onChange={setField(setLng, 'lng')} placeholder="如 114.057868" aria-invalid={!!errors.lng} />
+          <FieldError message={errors.lng} />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="region-lat">纬度</Label>
+          <Input id="region-lat" value={lat} onChange={setField(setLat, 'lat')} placeholder="如 22.543099" aria-invalid={!!errors.lat} />
+          <FieldError message={errors.lat} />
+        </div>
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="region-full">全称（可选，默认同名称）</Label>
+        <Input id="region-full" value={fullName} onChange={e => setFullName(e.target.value)} placeholder="默认同名称" />
+      </div>
+    </AppFormDialog>
+  )
+}

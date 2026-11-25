@@ -1,0 +1,97 @@
+import { randomBytes } from 'node:crypto'
+import path from 'node:path'
+
+import { getStorageDriver } from '../shared/storage/storage.driver.factory'
+
+export enum FileType {
+  IMAGE = '图片',
+  TXT = '文档',
+  MUSIC = '音乐',
+  VIDEO = '视频',
+  OTHER = '其他'
+}
+
+/** 按扩展名归类文件类型 */
+export function getFileType(extName: string): FileType {
+  const documents = 'txt doc pdf ppt pps xlsx xls docx'
+  const music = 'mp3 wav wma mpa ram ra aac aif m4a'
+  const video = 'avi mpg mpe mpeg asf wmv mov qt rm mp4 flv m4v webm ogv ogg'
+  const image = 'bmp dib pcp dif wmf gif jpg tif eps psd cdr iff tga pcd mpt png jpeg'
+  if (image.includes(extName)) return FileType.IMAGE
+  if (documents.includes(extName)) return FileType.TXT
+  if (music.includes(extName)) return FileType.MUSIC
+  if (video.includes(extName)) return FileType.VIDEO
+  return FileType.OTHER
+}
+
+/** 取不含点的小写扩展名 */
+export function getExtname(fileName: string): string {
+  return path.extname(fileName).replace('.', '').toLowerCase()
+}
+
+/** 字节数转可读大小，如 "1.5 MB" */
+export function getSize(bytes: number, decimals = 2): string {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return `${Number.parseFloat((bytes / k ** i).toFixed(Math.max(decimals, 0)))} ${sizes[i]}`
+}
+
+/**
+ * 取安全的文件名（不含目录）
+ *
+ * 用户上传的 originalname 完全可控，可能是 `../../etc/passwd` 或 `a/b.png`：
+ * 直接拼进落盘路径就是目录穿越，因此先去目录分隔符、再去非法字符，最后兜底 'file'。
+ */
+export function sanitizeFileName(fileName: string): string {
+  const base = path.basename(String(fileName ?? '').replace(/\\/g, '/'))
+  // eslint-disable-next-line no-control-regex -- 需要剔除控制字符（含 \0）
+  const cleaned = base.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').trim()
+  return cleaned || 'file'
+}
+
+/**
+ * 重命名：原名 + 时间戳 + 扩展名，防覆盖
+ * @param extOverride 扩展名覆盖（按文件头识别出的真实类型，避免「.html 里装着 png」）
+ */
+export function fileRename(fileName: string, extOverride?: string): string {
+  const safeName = sanitizeFileName(fileName)
+  const originalExt = path.extname(safeName)
+  const ext = (extOverride ?? originalExt.replace('.', '')).toLowerCase()
+  const base = path.posix.basename(safeName, originalExt).slice(0, 80) || 'file'
+  const time = new Date().toISOString().replace(/\D/g, '').slice(0, 17)
+  // 随机后缀：旧版只有「原文件名 + 毫秒时间戳」，知道文件名就能暴力枚举出别人的图片。
+  // upload 目录是公开静态直出（<img> 场景），不可枚举是这里唯一可行的防线。
+  const salt = randomBytes(4).toString('hex')
+  return `${base}-${time}-${salt}${ext ? `.${ext}` : ''}`
+}
+
+/** 数据库中存的相对访问路径 */
+export function getFilePath(name: string, currentDate: string, type: string): string {
+  return `/upload/${currentDate}/${type}/${name}`
+}
+
+/** 当前日期目录名 YYYY-MM-DD */
+export function getCurrentDate(): string {
+  const d = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/**
+ * @deprecated 已迁移到 shared/storage 驱动体系（getStorageDriver().put）。
+ * 本壳仅为兼容保留：转发到本地驱动，行为与旧实现逐字节一致。
+ */
+export async function saveLocalFile(buffer: Buffer, name: string, currentDate: string, type: string): Promise<void> {
+  await getStorageDriver().put(`${currentDate}/${type}/${name}`, buffer)
+}
+
+/**
+ * @deprecated 已迁移到 shared/storage 驱动体系（getStorageDriver().remove）。
+ * relativePath 是数据库里的相对访问路径（/upload/...），内部剥前缀转成存储键。
+ */
+export function deleteFile(relativePath: string): void {
+  const key = relativePath.replace(/^\/upload\//, '')
+  void getStorageDriver().remove(key)
+}

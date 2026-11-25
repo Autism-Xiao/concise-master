@@ -1,0 +1,449 @@
+import { BadRequestException, HttpStatus, Injectable, Logger } from '@nestjs/common'
+import { createHash } from 'node:crypto'
+
+import { BizErrorCode } from '../../../common/enums/biz-error-code.enum'
+import { BizException } from '../../../common/exceptions/biz.exception'
+import { Pagination } from '../../../helper/paginate'
+import { RealtimeService, WS_EVENTS } from '../../../shared/realtime/realtime.service'
+import { RedisService } from '../../../shared/redis/redis.service'
+import { TenantContext } from '../../../shared/tenant/tenant.context'
+import { parseRequestInfo } from '../../../utils/request-info.util'
+import type { QueryOnlineDto } from './dto/query-online.dto'
+
+/** 在线会话 key 前缀（Redis 3.x 兼容：只用一个前缀做 SCAN match） */
+const SESSION_PREFIX = 'online:session:'
+/** 强制下线的令牌黑名单前缀（TTL 到 token 自然过期即可，值记录拉黑时间戳用于重放判定） */
+const REVOKED_PREFIX = 'online:revoked:'
+/** 按用户维度的强制下线前缀：值记录时间戳，签发早于该时间的令牌一律失效 */
+const USER_REVOKED_PREFIX = 'online:user-revoked:'
+/** 会话活跃时间最小写入间隔（秒）：每个请求都写 Redis 太浪费，1 分钟粒度足够展示 */
+const TOUCH_INTERVAL_SECONDS = 60
+
+export interface OnlineSession {
+  sessionId: string
+  userId: string
+  username: string
+  dept: string
+  ip: string
+  location: string
+  browser: string
+  os: string
+  loginTime: string
+  lastActive: string
+  expiresAt: string
+  /**
+   * 会话登记时用户所在的租户上下文（touch 时刻的 TenantContext）。
+   * - `>0`：租户视角的会话
+   * - `0`：平台视角（超管未切租户）的会话
+   * - 缺失：本字段上线前的旧会话，视同 0（两小时内自然过期，不用迁移）
+   * 在线会话不是「共享数据」：租户管理员只能看到/踢除租户上下文的会话，
+   * 平台视角（filterTenantId = null）看全部。
+   */
+  tenantId?: number
+}
+
+/** JWT 策略里能拿到的请求最小形态（避免依赖 express 类型） */
+export interface SessionRequest {
+  ip?: string
+  headers: { 'user-agent'?: string | string[] | undefined }
+}
+
+export interface SessionUser {
+  id: string
+  username: string
+  depts?: { departName?: string }[]
+}
+
+/**
+ * 在线用户
+ *
+ * 在线用户来自 Redis 里的 token 记录 + 强制下线；本项目 JWT 无状态，
+ * 因此在 JwtStrategy 每次校验通过时按 accessToken 的哈希登记一条会话：
+ *   online:session:<tokenHash>  → JSON（账号/部门/IP/归属地/浏览器/系统/登录时间）
+ *   online:revoked:<tokenHash>  → 强制下线黑名单，TTL 到 token 过期
+ * 这样「在线列表」是真实的（有请求即在线），「强制下线」也是真的（后续请求 401）。
+ */
+@Injectable()
+export class OnlineService {
+  private readonly logger = new Logger(OnlineService.name)
+  private warned = false
+
+  constructor(
+    private readonly redis: RedisService,
+    private readonly realtime: RealtimeService
+  ) {}
+
+  /** token 哈希作为会话编号（不落原始 token，泄露也拿不到凭证） */
+  hashToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex').slice(0, 32)
+  }
+
+  /** 每次鉴权通过时登记/刷新会话 */
+  async touch(token: string, payload: { id: string; username: string; exp?: number }, request: SessionRequest, user?: SessionUser): Promise<void> {
+    const client = this.client()
+    if (!client) return
+    try {
+      const now = Math.floor(Date.now() / 1000)
+      const exp = payload.exp ?? now + 7200
+      const ttl = exp - now
+      if (ttl <= 0) return
+
+      const sessionId = this.hashToken(token)
+      const key = SESSION_PREFIX + sessionId
+      const existing = await client.get(key)
+      const previous = existing ? this.parse<OnlineSession>(existing) : null
+      // 降频：60 秒内已写过就跳过，避免每个请求 1 次 SETEX（QPS 上来后 Redis 写放大）
+      if (previous && Date.now() - new Date(previous.lastActive).getTime() < TOUCH_INTERVAL_SECONDS * 1000) {
+        return
+      }
+      const loginTime = previous?.loginTime ?? new Date().toISOString()
+      const ip = (request.ip ?? '').replace(/^::ffff:/, '')
+      const userAgent = Array.isArray(request.headers['user-agent']) ? request.headers['user-agent'][0] : request.headers['user-agent']
+      const info = parseRequestInfo(ip, userAgent)
+
+      const session: OnlineSession = {
+        sessionId,
+        userId: payload.id,
+        username: payload.username,
+        dept: user?.depts?.[0]?.departName ?? '',
+        ip,
+        location: info.location,
+        browser: info.browser,
+        os: info.os,
+        loginTime,
+        lastActive: new Date().toISOString(),
+        expiresAt: new Date(exp * 1000).toISOString(),
+        // 登记时的租户上下文：列表/踢人按这个归属做租户隔离（JwtStrategy 在中间件上下文内执行）
+        tenantId: TenantContext.filterTenantId() ?? 0
+      }
+      // Redis 3.x 兼容：用 SETEX 写整串 JSON（不用 HSET 多字段）
+      await client.setex(key, ttl, JSON.stringify(session))
+    } catch (error) {
+      this.warnOnce(`在线会话登记失败：${(error as Error).message}`)
+    }
+  }
+
+  /**
+   * 退出登录：令牌拉黑 + 删除在线会话（幂等，不要求会话存在）
+   * - accessToken 拉黑后 JwtStrategy 每次请求都会 401
+   * - refreshToken 一并拉黑（同一黑名单空间，哈希不同不冲突），防止登出后用 refreshToken 续命
+   * - Redis 未启用时静默跳过（JWT 无状态，登出仅退化为前端清 token）
+   */
+  async logout(token: string, ttlSeconds: number, refreshToken?: string, refreshTtlSeconds?: number): Promise<void> {
+    const client = this.client()
+    if (!client) return
+    try {
+      const ttl = Math.max(Math.floor(ttlSeconds), 60)
+      await this.markRevoked(token, ttl)
+      await client.del(SESSION_PREFIX + this.hashToken(token))
+      if (refreshToken) {
+        await this.markRevoked(refreshToken, Math.max(Math.floor(refreshTtlSeconds ?? ttl), 60))
+      }
+    } catch (error) {
+      this.warnOnce(`退出登录处理失败：${(error as Error).message}`)
+    }
+  }
+
+  /**
+   * 拉黑一个令牌（access / refresh 共用同一黑名单空间，哈希不同不冲突）
+   * 值存拉黑时间戳，refreshToken 轮换时靠它判断「是并发刷新还是真被盗用」
+   */
+  async markRevoked(token: string, ttlSeconds: number): Promise<void> {
+    const client = this.client()
+    if (!client) return
+    try {
+      await client.setex(REVOKED_PREFIX + this.hashToken(token), Math.max(Math.floor(ttlSeconds), 60), String(Date.now()))
+    } catch (error) {
+      this.warnOnce(`令牌拉黑失败：${(error as Error).message}`)
+    }
+  }
+
+  /** 令牌是否已失效，以及（若失效）失效时间：用于 refreshToken 重放检测 */
+  async getRevocation(token: string): Promise<{ revoked: boolean; at: number }> {
+    const client = this.client()
+    if (!client) return { revoked: false, at: 0 }
+    try {
+      const value = await client.get(REVOKED_PREFIX + this.hashToken(token))
+      if (value === null) return { revoked: false, at: 0 }
+      const at = Number(value)
+      return { revoked: true, at: Number.isFinite(at) ? at : 0 }
+    } catch (error) {
+      this.warnOnce(`下线状态查询失败：${(error as Error).message}`)
+      return { revoked: false, at: 0 }
+    }
+  }
+
+  /**
+   * 原子「检查 + 拉黑」：refreshToken 轮换专用。
+   * Lua 内一次完成「读旧值 → 若无则写拉黑时间戳」，并发刷新只有一个请求拿到 first=true，
+   * 其余读到已拉黑状态，杜绝 check-and-mark 分离导致的并发双发令牌。
+   * 返回 { revoked: 之前是否已拉黑, at: 之前记录的拉黑时间戳, first: 本次是否首次写入 }。
+   */
+  async consumeRevocation(token: string, ttlSeconds: number): Promise<{ revoked: boolean; at: number; first: boolean }> {
+    const client = this.client()
+    if (!client) return { revoked: false, at: 0, first: false }
+    try {
+      const ttl = Math.max(Math.floor(ttlSeconds), 60)
+      const lua =
+        "local old = redis.call('GET', KEYS[1]) " +
+        'if old then return {1, tonumber(old) or 0, 0} end ' +
+        "redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2]) " +
+        'return {0, 0, 1}'
+      const result = await client.eval(lua, 1, REVOKED_PREFIX + this.hashToken(token), String(ttl), String(Date.now()))
+      const [revoked, at, first] = Array.isArray(result) ? result : [0, 0, 0]
+      return { revoked: Number(revoked) === 1, at: Number(at) || 0, first: Number(first) === 1 }
+    } catch (error) {
+      // fail-open：Redis 故障时 JWT 仍可无状态校验，放行刷新（与 getRevocation 降级口径一致）
+      this.warnOnce(`refreshToken 原子拉黑失败（降级放行）：${(error as Error).message}`)
+      return { revoked: false, at: 0, first: true }
+    }
+  }
+
+  /** 是否已被强制下线 */
+  async isRevoked(token: string): Promise<boolean> {
+    return (await this.getRevocation(token)).revoked
+  }
+
+  /**
+   * 按用户维度强制下线：之后签发时间早于该时间的令牌一律失效
+   * 用于「refreshToken 被重复使用」这类确定被盗用的场景，一次踢掉该账号所有会话
+   * 注意：JWT 的 iat 是秒级，这里的时间戳必须对齐到整秒——否则同一秒内
+   * 「先踢人、后登录」签发的新令牌会被误判为下线前签发，用户立刻 401
+   */
+  async revokeUser(userId: string, ttlSeconds: number): Promise<void> {
+    const client = this.client()
+    if (!client || !userId) return
+    try {
+      await client.setex(USER_REVOKED_PREFIX + userId, Math.max(Math.floor(ttlSeconds), 60), String(Math.floor(Date.now() / 1000) * 1000))
+    } catch (error) {
+      this.warnOnce(`用户级下线失败：${(error as Error).message}`)
+    }
+  }
+
+  /** 该令牌是否已失效（令牌黑名单 + 用户级下线两个维度，合并成一次往返） */
+  async isSessionInvalid(token: string, userId: string, issuedAtSeconds?: number): Promise<boolean> {
+    const client = this.client()
+    if (!client) return false
+    try {
+      const [tokenValue, userValue] = await client.mget(REVOKED_PREFIX + this.hashToken(token), USER_REVOKED_PREFIX + userId)
+      if (tokenValue !== null) {
+        return true
+      }
+      if (userValue !== null && issuedAtSeconds) {
+        const at = Number(userValue)
+        return Number.isFinite(at) && issuedAtSeconds * 1000 < at
+      }
+      return false
+    } catch (error) {
+      this.warnOnce(`下线状态查询失败：${(error as Error).message}`)
+      return false
+    }
+  }
+
+  /**
+   * 用户级下线标记是否早于令牌签发时间（refreshToken 续命链路的专用检查）。
+   *
+   * 为什么必须有它：refreshToken 换新令牌走的是 `getRevocation`（只查令牌级黑名单），
+   * 而用户级吊销（改密/重置密码/冻结时 kickUser 全量写入）只挂在 JwtStrategy 的
+   * isSessionInvalid 上 —— 结果是旧 accessToken 死了，旧 refreshToken 却还能换出新令牌，
+   * 「重置密码踢下线」对持有 refreshToken 的设备形同虚设。
+   */
+  async isUserRevokedSince(userId: string, issuedAtSeconds?: number): Promise<boolean> {
+    const client = this.client()
+    if (!client || !issuedAtSeconds) return false
+    try {
+      const value = await client.get(USER_REVOKED_PREFIX + userId)
+      if (value === null) return false
+      const at = Number(value)
+      return Number.isFinite(at) && issuedAtSeconds * 1000 < at
+    } catch (error) {
+      this.warnOnce(`用户级下线状态查询失败：${(error as Error).message}`)
+      return false
+    }
+  }
+
+  /** 在线用户列表（Redis SCAN 后按关键字过滤、按登录时间倒序、内存分页） */
+  async list(query: QueryOnlineDto): Promise<Pagination<OnlineSession>> {
+    const client = this.client()
+    const page = Math.max(query.page ?? 1, 1)
+    const pageSize = Math.max(query.pageSize ?? 10, 1)
+    if (!client) {
+      return new Pagination<OnlineSession>([], 0, page, pageSize)
+    }
+
+    let sessions: OnlineSession[] = []
+    try {
+      const keys: string[] = []
+      let cursor = '0'
+      do {
+        const [next, batch] = await client.scan(cursor, 'MATCH', `${SESSION_PREFIX}*`, 'COUNT', 200)
+        cursor = next
+        keys.push(...batch)
+      } while (cursor !== '0')
+
+      if (keys.length) {
+        const values = await client.mget(...keys)
+        sessions = values.map(value => (value ? this.parse<OnlineSession>(value) : null)).filter((item): item is OnlineSession => item !== null)
+      }
+    } catch (error) {
+      this.warnOnce(`在线会话读取失败：${(error as Error).message}`)
+      return new Pagination<OnlineSession>([], 0, page, pageSize)
+    }
+
+    const keyword = query.keyword?.trim().toLowerCase()
+    if (keyword) {
+      sessions = sessions.filter(item =>
+        [item.username, item.ip, item.location, item.browser, item.os, item.dept].some(field => (field ?? '').toLowerCase().includes(keyword))
+      )
+    }
+    // 租户隔离：租户视角只看「本租户上下文登记」的会话（精确等于，不含 0——
+    // 0 是平台视角的会话，属于平台数据，不是共享数据）；平台视角（null）看全部。
+    // 会话里的 tenantId 缺失（旧记录）视同 0。
+    const scopeTenantId = TenantContext.filterTenantId()
+    if (scopeTenantId !== null) {
+      sessions = sessions.filter(item => (item.tenantId ?? 0) === scopeTenantId)
+    }
+    sessions.sort((a, b) => b.loginTime.localeCompare(a.loginTime))
+
+    const start = (page - 1) * pageSize
+    return new Pagination(sessions.slice(start, start + pageSize), sessions.length, page, pageSize)
+  }
+
+  /** 强制下线：删会话 + 进黑名单（后续请求由 JwtStrategy 拦截） */
+  async kick(sessionId: string): Promise<void> {
+    const client = this.client()
+    if (!client) {
+      throw new BizException(BizErrorCode.SESSION_EXPIRED, '在线会话不存在或已过期', HttpStatus.NOT_FOUND)
+    }
+    const key = SESSION_PREFIX + sessionId
+    const raw = await client.get(key)
+    const session = raw ? this.parse<OnlineSession>(raw) : null
+    if (!session) {
+      throw new BizException(BizErrorCode.SESSION_EXPIRED, '在线会话不存在或已过期', HttpStatus.NOT_FOUND)
+    }
+    // 租户边界：租户视角只能踢「本租户上下文登记」的会话；跨租户的按不存在处理（不泄漏会话是否存在）
+    const scopeTenantId = TenantContext.filterTenantId()
+    if (scopeTenantId !== null && (session.tenantId ?? 0) !== scopeTenantId) {
+      throw new BizException(BizErrorCode.SESSION_EXPIRED, '在线会话不存在或已过期', HttpStatus.NOT_FOUND)
+    }
+    const ttl = Math.max(Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000), 60)
+    // sessionId 本身就是 token 哈希，这里直接拼 key（不能再走 markRevoked，那会二次哈希）
+    await client.setex(REVOKED_PREFIX + sessionId, ttl, String(Date.now()))
+    await client.del(key)
+    // WebSocket 通知客户端立即登出（不在线的靠黑名单在下次请求时拦截）
+    if (session) {
+      this.realtime.pushToUser(session.userId, WS_EVENTS.forceOffline, { sessionId, reason: '您已被管理员强制下线' })
+    }
+  }
+
+  /** 批量强退：逐条踢，会话已过期的不算失败（本来就不在线） */
+  async batchKick(sessionIds: string[]): Promise<{ kicked: number; failed: Array<{ id: string; reason: string }> }> {
+    const ids = [...new Set(sessionIds.map(id => String(id ?? '').trim()).filter(Boolean))]
+    if (!ids.length) {
+      throw new BadRequestException('请选择要下线的用户')
+    }
+    if (ids.length > 200) {
+      throw new BadRequestException('单次最多下线 200 个会话，请分批操作')
+    }
+    const result: { kicked: number; failed: Array<{ id: string; reason: string }> } = { kicked: 0, failed: [] }
+    for (const id of ids) {
+      try {
+        await this.kick(id)
+        result.kicked += 1
+      } catch (error) {
+        result.failed.push({ id, reason: error instanceof Error ? error.message : '下线失败' })
+      }
+    }
+    return result
+  }
+
+  /** 用户级拉黑的兜底 TTL：盖过最长的 refreshToken（7 天）再加 1 小时余量 */
+  private static readonly USER_REVOKE_TTL = 7 * 24 * 3600 + 3600
+
+  /**
+   * 按用户强制下线：踢掉该用户全部在线会话，返回踢掉的会话数
+   * - keepToken：保留的原始 accessToken（自助改密场景保留当前浏览器，其他端全部下线）
+   * - 未保留场景额外写用户级拉黑标记：签发时间早于此刻的所有令牌（含从未登记过会话的）一并失效
+   */
+  async kickUser(userId: string, opts?: { keepToken?: string }): Promise<number> {
+    const client = this.client()
+    if (!client || !userId) return 0
+    const keepHash = opts?.keepToken ? this.hashToken(opts.keepToken) : null
+    let kicked = 0
+    try {
+      const keys: string[] = []
+      let cursor = '0'
+      do {
+        const [next, batch] = await client.scan(cursor, 'MATCH', `${SESSION_PREFIX}*`, 'COUNT', 200)
+        cursor = next
+        keys.push(...batch)
+      } while (cursor !== '0')
+
+      if (keys.length) {
+        const values = await client.mget(...keys)
+        for (let i = 0; i < keys.length; i += 1) {
+          const session = values[i] ? this.parse<OnlineSession>(values[i]!) : null
+          if (!session || session.userId !== userId) continue
+          const sessionId = keys[i]!.slice(SESSION_PREFIX.length)
+          if (keepHash && sessionId === keepHash) continue
+          const ttl = Math.max(Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000), 60)
+          await client.setex(REVOKED_PREFIX + sessionId, ttl, String(Date.now()))
+          await client.del(keys[i]!)
+          kicked += 1
+        }
+      }
+      // 全量下线时补用户级标记：覆盖「已签发但还没发过请求、没登记会话」的令牌
+      if (!keepHash) {
+        await this.revokeUser(userId, OnlineService.USER_REVOKE_TTL)
+      }
+      if (kicked > 0) {
+        this.realtime.pushToUser(userId, WS_EVENTS.forceOffline, { reason: '您已被强制下线' })
+      }
+      return kicked
+    } catch (error) {
+      this.warnOnce(`用户级强制下线失败：${(error as Error).message}`)
+      return kicked
+    }
+  }
+
+  /** 在线人数（登录页/首页展示可用） */
+  async count(): Promise<number> {
+    const client = this.client()
+    if (!client) return 0
+    try {
+      let cursor = '0'
+      let count = 0
+      do {
+        const [next, batch] = await client.scan(cursor, 'MATCH', `${SESSION_PREFIX}*`, 'COUNT', 500)
+        cursor = next
+        count += batch.length
+      } while (cursor !== '0')
+      return count
+    } catch (error) {
+      this.warnOnce(`在线人数统计失败：${(error as Error).message}`)
+      return 0
+    }
+  }
+
+  private client() {
+    if (!this.redis.enabled || !this.redis.client) {
+      this.warnOnce('Redis 未启用，在线用户与强制下线不可用（REDIS_ENABLED=false）')
+      return null
+    }
+    return this.redis.client
+  }
+
+  private parse<T>(value: string): T | null {
+    try {
+      return JSON.parse(value) as T
+    } catch {
+      return null
+    }
+  }
+
+  private warnOnce(message: string): void {
+    if (this.warned) return
+    this.warned = true
+    this.logger.warn(message)
+  }
+}

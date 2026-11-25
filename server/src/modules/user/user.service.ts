@@ -1,0 +1,1994 @@
+import { BadRequestException, ForbiddenException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common'
+import { InjectRepository } from '@nestjs/typeorm'
+import { In, Not, Repository, SelectQueryBuilder, type EntityManager, type FindOptionsWhere, type QueryDeepPartialEntity } from 'typeorm'
+
+import { BizErrorCode } from '../../common/enums/biz-error-code.enum'
+import { BizException } from '../../common/exceptions/biz.exception'
+import { BaseService } from '../../helper/crud/base.service'
+import { normalizeBatchIds, runBatchDelete, type BatchDeleteResult } from '../../helper/crud/batch-delete'
+import { applySort, paginate, type PaginateOptions, type Pagination } from '../../helper/paginate'
+import { PermissionCacheService } from '../../shared/permission-cache/permission-cache.service'
+import { AuthUserCacheService } from '../../shared/auth-cache/auth-user-cache.service'
+import { RateLimitService } from '../../shared/rate-limit/rate-limit.service'
+import { loginFailKeyOf } from '../../shared/rate-limit/login-fail.util'
+import { applyTenantScope, tenantWriteSql } from '../../shared/tenant/tenant-scope.util'
+import { TenantContext } from '../../shared/tenant/tenant.context'
+import { TenantAccessService } from '../../shared/tenant/tenant-access.service'
+import { OnlineService } from '../ops/online/online.service'
+import { randomToken } from '../../utils/random-token.util'
+import { describeDuplicateEntry, isDuplicateEntryError } from '../../utils/db-error.util'
+import { encryptPassword, hashPassword, isArgon2Hash, randomId32, verifyArgon2Password } from '../../utils/password.util'
+import { assertPasswordStrength } from '../../utils/password-policy.util'
+import { SystemConfigService } from '../system/config/system-config.service'
+import { WebhookService } from '../openapi/webhook.service'
+import { DeptEntity } from '../system/dept/entities/dept.entity'
+import { PostEntity } from '../system/post/entities/post.entity'
+import { LevelEntity } from '../system/level/entities/level.entity'
+import { UserWatermarkEntity } from '../system/watermark/entities/user-watermark.entity'
+import { WatermarkSettingEntity } from '../system/watermark/entities/watermark-setting.entity'
+import { FALLBACK_WATERMARK_SETTING, resolveWatermarkState } from '../system/watermark/watermark.util'
+import { UserSettingService } from '../system/user-setting/user-setting.service'
+import { UserEntity } from './entities/user.entity'
+import { SuperviseDeptEntity } from './entities/supervise-dept.entity'
+import { RoleEntity } from '../role/entities/role.entity'
+import type { QueryUserDto } from './dto/query-user.dto'
+import type { UpdateMyProfileDto } from './dto/update-my-profile.dto'
+import type { UpdateUserVipDto } from './dto/update-user-vip.dto'
+import { userKeywordClause, userKeywordParam } from './user-search.util'
+import { QuotaService } from '../../shared/quota/quota.service'
+import { sqlInsertIgnorePrefix, sqlInsertIgnoreSuffix } from '../../shared/database/sql-dialect'
+import { queryRaw } from '../../shared/database/raw-query'
+import { sqlSumIf } from '../../shared/database/sql-dialect'
+
+/** 用户状态（对齐 sys_user）：1 正常 / 2 冻结 */
+export const USER_STATUS = { NORMAL: 1, FROZEN: 2 } as const
+
+/** 数据范围（sys_role.data_scope）：数值越小可见范围越大，取用户多角色里最小值 */
+export const DATA_SCOPE = { ALL: 1, DEPT_AND_CHILDREN: 2, DEPT_ONLY: 3, SELF_ONLY: 4 } as const
+
+/** 导出上限：单文件 5000 行，避免一次把几十万用户塞进内存 */
+export const USER_EXPORT_MAX_ROWS = 5000
+
+/** 导入单文件上限：2000 行、5MB（与角色导入保持一致） */
+export const USER_IMPORT_MAX_ROWS = 2000
+export const USER_IMPORT_MAX_SIZE = 5 * 1024 * 1024
+
+/** 默认租户（平台运营兜底租户）：平台视角下新建的账号默认归属这里 */
+const DEFAULT_TENANT_ID = 1
+
+/** 批量查账号单次上限（选择器回显用，超出部分截断，避免超长 IN 查询） */
+export const USER_LOOKUP_MAX_IDS = 100
+
+/** 登录账号规则：3~100 位，字母开头，允许字母/数字/下划线/点/横线/@（与登录框输入习惯一致的宽松规则） */
+const USERNAME_PATTERN = /^[A-Za-z][A-Za-z0-9_.@-]{2,99}$/
+
+/** 可排序字段白名单：前端列 id → 实体属性名（含不到的列点了表头也只走默认的创建时间倒序） */
+const USER_SORTABLE: Record<string, string> = {
+  username: 'username',
+  realname: 'realname',
+  email: 'email',
+  phone: 'phone',
+  status: 'status',
+  createTime: 'createTime'
+}
+
+/** 导入结果：逐行统计 + 失败明细（前端据此展示导入报告） */
+export interface UserImportResult {
+  /** 参与解析的数据行数（不含表头、空行） */
+  total: number
+  created: number
+  updated: number
+  /** 跳过行数（同一份文件内账号重复） */
+  skipped: number
+  failed: number
+  errors: Array<{ row: number; username: string; message: string }>
+  /** 新建账号的随机初始密码（导入时密码列留空自动生成；仅在本次响应里出现一次，请线下告知用户并提醒首次登录修改） */
+  generatedPasswords: Array<{ row: number; username: string; password: string }>
+}
+
+/** 导入列：key 与模板表头别名对应 */
+type UserImportField = 'username' | 'realname' | 'password' | 'phone' | 'email' | 'sex' | 'birthday' | 'workNo' | 'deptNames' | 'roleNames' | 'status'
+
+/** 表头别名：兼容用户手改列名、或从别处复制过来的表头 */
+const USER_IMPORT_ALIASES: Record<UserImportField, string[]> = {
+  username: ['登录账号', '账号', '用户名', 'username'],
+  realname: ['真实姓名', '姓名', 'realname'],
+  password: ['密码', '初始密码', 'password'],
+  phone: ['手机号', '手机', '电话', 'phone'],
+  email: ['邮箱', '电子邮件', 'email'],
+  sex: ['性别', 'sex'],
+  birthday: ['生日', '出生日期', 'birthday'],
+  workNo: ['工号', 'workno'],
+  deptNames: ['所属部门', '部门', 'deptname', 'dept'],
+  roleNames: ['角色', '角色名称', '角色编码', 'role'],
+  status: ['状态', 'status']
+}
+
+/** 多值分隔符：斜杠/中英文逗号/顿号/分号/竖线，导入时都当分隔符，避免用户纠结用哪个 */
+const MULTI_VALUE_SEPARATOR = /[/,，、;；|]+/
+
+/** 性别可读值 → 数据库值（0 未知 / 1 男 / 2 女） */
+const SEX_LABELS: Record<string, number> = { 男: 1, 女: 2, 未知: 0, 1: 1, 2: 2, 0: 0, male: 1, female: 2 }
+
+/** 状态可读值 → 数据库值（1 正常 / 2 冻结） */
+const STATUS_LABELS: Record<string, number> = { 正常: 1, 启用: 1, 1: 1, 冻结: 2, 停用: 2, 禁用: 2, 2: 2 }
+
+/** 拆分多值单元格并去空去重（保留原顺序，第一个部门即主部门） */
+function splitMultiValue(raw: string): string[] {
+  if (!raw) {
+    return []
+  }
+  return [
+    ...new Set(
+      raw
+        .split(MULTI_VALUE_SEPARATOR)
+        .map(item => item.trim())
+        .filter(Boolean)
+    )
+  ]
+}
+
+/** 日期归一：接受 1990-01-01 / 1990/1/1 / 1990.1.1，统一成 YYYY-MM-DD；非法返回 null */
+function normalizeDateText(raw: string): string | null {
+  const match = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/.exec(raw.trim())
+  if (!match) {
+    return null
+  }
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const date = new Date(year, month - 1, day)
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+    return null
+  }
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+/**
+ * 创建/更新入参
+ * - 实体字段之外，附带角色、部门 id 列表（关联关系不落在主表，需单独写关联表）
+ * - deptId 为旧字段，等价 deptIds: [deptId]
+ */
+type UserWriteInput = Omit<Partial<UserEntity>, 'passwordExpireAt'> & {
+  passwordExpireAt?: string | Date | null
+  roleIds?: string[]
+  deptIds?: string[]
+  deptId?: string
+  postIds?: string[]
+}
+
+/** 归一化密码过期时间：DTO 里是 ISO/日期字符串，入库前转 Date；空值统一为 null（不限制） */
+function normalizePasswordExpireAt(raw?: string | Date | null): Date | null {
+  if (raw === null || raw === undefined || raw === '') {
+    return null
+  }
+  const date = raw instanceof Date ? raw : new Date(raw)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+/** 归一化部门 id：deptIds 优先，其次兼容单个 deptId；去重去空并保持入参顺序（首个为主部门） */
+function normalizeDeptIds(deptIds?: string[], deptId?: string): string[] {
+  return [...new Set((deptIds ?? (deptId ? [deptId] : [])).filter(Boolean))]
+}
+
+/** 唯一键字段：数据库对这三列建了唯一索引，写入前必须预检，否则用户只会看到 Duplicate entry SQL */
+type UniqueField = 'phone' | 'email' | 'workNo'
+
+/** 唯一键占用信息：谁占了这个值、该账号是否已被软删（软删不释放唯一索引） */
+interface UniqueOwner {
+  username: string
+  deleted: boolean
+}
+
+/** 唯一键归一：去空格 + 小写，邮箱大小写不敏感，手机号/工号容忍用户手输首尾空格 */
+function uniqueKey(value?: string | null): string {
+  return (value ?? '').trim().toLowerCase()
+}
+
+/**
+ * 把数据库写入异常翻译成业务中文
+ * - 唯一键冲突（预检漏网：并发导入、软删账号占用等）不再把 SQL 抛给用户
+ * - 其余异常保留原文，便于排查
+ */
+function describeWriteError(error: unknown): string {
+  const duplicated = describeDuplicateEntry(error)
+  if (duplicated) {
+    return duplicated
+  }
+  return (error instanceof Error ? error.message : '') || '写入失败'
+}
+
+/** 数据范围判定入参：req.user（含 roles 与 departIds）即可，无需额外查询 */
+interface DataScopeActor {
+  id: string
+  roles?: RoleEntity[] | null
+  departIds?: string | null
+  /** 平台管理员标志（sys_user.is_platform_admin）：不受数据范围收窄 */
+  isPlatformAdmin?: number
+}
+
+@Injectable()
+export class UserService extends BaseService<UserEntity> {
+  constructor(
+    @InjectRepository(UserEntity)
+    repository: Repository<UserEntity>,
+    @InjectRepository(RoleEntity)
+    private readonly roleRepository: Repository<RoleEntity>,
+    @InjectRepository(DeptEntity)
+    private readonly deptRepository: Repository<DeptEntity>,
+    @InjectRepository(SuperviseDeptEntity)
+    private readonly superviseRepository: Repository<SuperviseDeptEntity>,
+    @InjectRepository(UserWatermarkEntity)
+    private readonly userWatermarkRepository: Repository<UserWatermarkEntity>,
+    @InjectRepository(WatermarkSettingEntity)
+    private readonly watermarkSettingRepository: Repository<WatermarkSettingEntity>,
+    @InjectRepository(PostEntity)
+    private readonly postRepository: Repository<PostEntity>,
+    @InjectRepository(LevelEntity)
+    private readonly levelRepository: Repository<LevelEntity>,
+    private readonly rateLimitService: RateLimitService,
+    private readonly onlineService: OnlineService,
+    private readonly permissionCacheService: PermissionCacheService,
+    private readonly userSettingService: UserSettingService,
+    private readonly authUserCache: AuthUserCacheService,
+    private readonly tenantAccess: TenantAccessService,
+    private readonly systemConfig: SystemConfigService,
+    private readonly webhookService: WebhookService,
+    private readonly quota: QuotaService
+  ) {
+    super(repository, '用户')
+  }
+
+  /** 创建：生成 32 位主键；密码统一用 argon2id 哈希（自带盐，不再写 sys_user.salt） */
+  async create(dto: UserWriteInput, operator?: string): Promise<UserEntity> {
+    const { roleIds, deptIds, deptId, postIds, passwordExpireAt, ...rest } = dto
+    const data: Partial<UserEntity> = { ...rest }
+    this.stripUnwritableFields(data)
+    data.levelId = await this.resolveLevelId(data.levelId)
+    // 租户 Seats 配额：放在事务外，超限直接业务错；0/负数配置由 QuotaService 视为不限制
+    await this.quota.assertUserQuota(this.resolveJoinTenantId())
+    data.passwordExpireAt = normalizePasswordExpireAt(passwordExpireAt)
+    // 唯一性预检：数据库唯一索引不区分软删除，必须提前给出可读提示（否则并发/软删占用会以 500 暴露）
+    await this.assertUniqueFields(data)
+    data.id = data.id || randomId32()
+    if (data.password) {
+      // 强度校验放在哈希之前：策略来自 sys_config，改配置即时生效
+      await this.assertPassword(data.password, data.username)
+      data.password = await hashPassword(data.password)
+      data.salt = null
+      data.passwordExpireAt = data.passwordExpireAt ?? (await this.resolvePasswordExpireAt())
+      // sys_config「首次登录强制改密」：建号时带初始密码的用户打上 mustChangePassword 标记，
+      // 登录门禁与自助改密（clearPasswordFlags）闭环；管理员显式传 0 表示豁免
+      if (data.mustChangePassword !== 0 && (await this.systemConfig.getBoolean('security.password.forceChangeOnFirstLogin', false))) {
+        data.mustChangePassword = 1
+      }
+    }
+    data.status = data.status || USER_STATUS.NORMAL
+    data.delFlag = 0
+    if (operator) {
+      data.createBy = operator
+      data.updateBy = operator
+    }
+    if (!data.createTime) {
+      data.createTime = new Date()
+    }
+    const nextDeptIds = normalizeDeptIds(deptIds, deptId)
+
+    // 主表 + 角色关联 + 部门关联必须同生共死：任一步失败整体回滚，不留「建好了但没权限」的半成品
+    const id = await this.runInTransaction(async manager => {
+      const repo = this.repoOf(manager)
+      const user = await repo.save(repo.create(data))
+      // 租户归属必须先于角色绑定落库：is_tenant_admin 的派生要 join sys_user_tenant，
+      // 而且「先入租户再绑角色」语义上也更正确（角色是租户内资产）
+      await queryRaw(
+        manager,
+        `${sqlInsertIgnorePrefix()} sys_user_tenant (user_id, tenant_id, status, create_time) VALUES (?, ?, 0, NOW())${sqlInsertIgnoreSuffix()}`,
+        [user.id, this.resolveJoinTenantId()]
+      )
+      if (roleIds?.length) {
+        await this.assignRoles(user.id, roleIds, manager)
+      }
+      if (nextDeptIds.length) {
+        await this.assignDepts(user.id, nextDeptIds, manager)
+      }
+      if (postIds?.length) {
+        await this.assignPosts(user.id, postIds, manager)
+      }
+      // 界面设置行随账号一起落库：同一事务，不留「有用户没设置」的半成品
+      await this.userSettingService.ensure(user.id, manager)
+      return user.id
+    })
+    const created = (await this.findOneDetail(id)) as UserEntity
+    // 开放平台事件：创建成功才发，失败静默（订阅方靠 user.id 幂等）
+    this.webhookService.dispatch(
+      'user.created',
+      { id: created.id, username: created.username, realname: created.realname ?? null },
+      { tenantId: this.resolveJoinTenantId() }
+    )
+    return created
+  }
+
+  /** 新账号默认归属的租户：当前租户上下文 > 默认租户（0/平台视角都落到 1） */
+  private resolveJoinTenantId(): number {
+    const tenantId = TenantContext.filterTenantId()
+    return tenantId !== null && tenantId > 0 ? tenantId : DEFAULT_TENANT_ID
+  }
+
+  /** 更新：携带密码则用 argon2id 重新哈希；携带 roleIds / deptIds / postIds 则重绑关联 */
+  async update(id: string, dto: UserWriteInput, operator?: string): Promise<UserEntity> {
+    const { roleIds, deptIds, deptId, postIds, passwordExpireAt, ...rest } = dto
+    const data: Partial<UserEntity> = { ...rest }
+    this.stripUnwritableFields(data)
+    delete data.username // 账号不允许修改（改账号会让审计与历史密码哈希对不上）
+    data.levelId = await this.resolveLevelId(data.levelId)
+    data.passwordExpireAt = normalizePasswordExpireAt(passwordExpireAt)
+    // 留一份改前快照：下面走的是自己写的事务（不是 super.update），审计要手动喂
+    const before = await this.findOne(id)
+    await this.assertUniqueFields(data, id)
+    if (data.password) {
+      // 改密码同样过策略；用户名不可改，用原用户名校验「不能包含用户名」
+      await this.assertPassword(data.password, data.username)
+      // argon2id 自带盐，顺手把历史盐清空，避免后续误按旧算法校验
+      data.password = await hashPassword(data.password)
+      data.salt = null
+      data.passwordExpireAt = data.passwordExpireAt ?? (await this.resolvePasswordExpireAt())
+    }
+    if (operator) {
+      data.updateBy = operator
+    }
+    data.updateTime = new Date()
+    // 传了 deptIds（含空数组）或旧字段 deptId 才重绑部门；都不传则保持原样
+    const hasDeptChange = deptIds !== undefined || deptId !== undefined
+    const nextDeptIds = normalizeDeptIds(deptIds, deptId)
+
+    await this.runInTransaction(async manager => {
+      await this.repoOf(manager).update(id, data)
+      if (roleIds) {
+        await this.assignRoles(id, roleIds, manager)
+      }
+      if (hasDeptChange) {
+        await this.assignDepts(id, nextDeptIds, manager)
+      }
+      if (postIds) {
+        await this.assignPosts(id, postIds, manager)
+      }
+    })
+    // 字段级审计：data 里的 password/salt 会被采集器的敏感字段黑名单过滤掉
+    this.auditUpdate(before, data)
+    return this.findOneDetail(id) as Promise<UserEntity>
+  }
+
+  /** 绑定角色（全量覆盖：多退少补）；只能分配本租户的角色 */
+  async assignRoles(id: string, roleIds: string[], manager?: EntityManager): Promise<void> {
+    // 独立接口直接调用时校验用户存在；事务内调用时由调用方（create/update）负责校验
+    if (!manager) {
+      await this.findOne(id)
+    }
+    const em = manager ?? this.repository.manager
+    const ids = [...new Set(roleIds.filter(Boolean))]
+    const roles = ids.length ? await em.getRepository(RoleEntity).findBy({ id: In(ids) }) : []
+    // 无效 id 必须报错：静默忽略会让人以为「授权成功了」，实际少给了一半
+    if (roles.length !== ids.length) {
+      const found = new Set(roles.map(role => role.id))
+      throw new BadRequestException(`角色不存在：${ids.filter(roleId => !found.has(roleId)).join(',')}`)
+    }
+    // 角色是租户级资产：租户 A 的账号不能绑租户 B 的 admin 角色 —— PermsGuard 是按 role_id
+    // 直接认权限的，绑上就等于跨租户拿到对方的全部按钮权限。平台视角（null）不受限，用于开通租户。
+    const currentTenant = TenantContext.filterTenantId()
+    if (currentTenant !== null) {
+      const illegal = roles.filter(role => {
+        const owner = Number(role.tenantId ?? 0)
+        return owner !== 0 && owner !== currentTenant
+      })
+      if (illegal.length) {
+        throw new BizException(
+          BizErrorCode.TENANT_ROLE_BOUNDARY,
+          `角色「${illegal.map(role => role.roleName ?? role.roleCode).join('、')}」不属于当前租户，不能分配`,
+          HttpStatus.BAD_REQUEST
+        )
+      }
+    }
+
+    // 用显式 SQL 而不是 relation API：关联表要写 tenant_id（记的是角色归属租户），
+    // relation API 只能写两列，让它留默认值 0 的话这张表就永远查不出真实归属。
+    //
+    // 「全量覆盖」只能覆盖**当前租户视角内**的绑定：currentRows 若取该用户在所有租户的
+    // 角色，A 租户管理员把自己的角色列表提交上来，就会把此人在 B 租户的角色一并删掉
+    // （B 租户的管理员/编辑器权限凭空消失）。平台视角（null）才保留全租户语义，用于运维。
+    const roleScope = TenantContext.filterTenantId()
+    const scopeSql = tenantWriteSql(roleScope)
+    const currentRows = await queryRaw<Array<{ role_id: string }>>(em, `SELECT role_id FROM sys_user_role WHERE user_id = ?${scopeSql.clause}`, [
+      id,
+      ...scopeSql.params
+    ])
+    const currentIds = new Set(currentRows.map(row => row.role_id))
+    const toRemove = [...currentIds].filter(roleId => !ids.includes(roleId))
+    const toAdd = roles.filter(role => !currentIds.has(role.id))
+
+    if (toRemove.length) {
+      // 兜底：不能解绑某租户最后一个 admin 角色，否则该租户再无人能管
+      const removingRoles = await em.getRepository(RoleEntity).findBy({ id: In(toRemove) })
+      for (const role of removingRoles) {
+        if (role.roleCode !== 'admin' || Number(role.tenantId ?? 0) <= 0) continue
+        const remainRows = await queryRaw<Array<{ c: number | string }>>(
+          em,
+          `SELECT COUNT(*) AS c
+             FROM sys_user_role ur
+             JOIN sys_role r ON r.id = ur.role_id
+             JOIN sys_user_tenant ut ON ut.user_id = ur.user_id AND ut.tenant_id = r.tenant_id AND ut.status = 0
+            WHERE r.tenant_id = ? AND r.role_code = 'admin' AND ur.user_id <> ?`,
+          [Number(role.tenantId), id]
+        )
+        if (Number(remainRows[0]?.c ?? 0) === 0) {
+          throw new BadRequestException(`不能取消租户 #${role.tenantId} 最后一个管理员角色，请先指定其他管理员`)
+        }
+      }
+      const placeholders = toRemove.map(() => '?').join(',')
+      // 删除条件与上面的读取范围一致：租户视角只解绑本租户的角色行，
+      // 共享角色（tenant_id=0）和其它租户的绑定都不动。
+      await queryRaw(em, `DELETE FROM sys_user_role WHERE user_id = ?${scopeSql.clause} AND role_id IN (${placeholders})`, [
+        id,
+        ...scopeSql.params,
+        ...toRemove
+      ])
+    }
+    for (const role of toAdd) {
+      await queryRaw(em, `${sqlInsertIgnorePrefix()} sys_user_role (id, user_id, role_id, tenant_id) VALUES (?, ?, ?, ?)${sqlInsertIgnoreSuffix()}`, [
+        randomId32(),
+        id,
+        role.id,
+        Number(role.tenantId ?? 0)
+      ])
+    }
+    // 重新派生 is_tenant_admin 标志位（兜底防锁死 + 前端标注）
+    await this.syncTenantAdminFlag(id, em)
+    // 角色变了，JwtStrategy 缓存的 roles 就过期了（RolesGuard 直接读它）
+    this.authUserCache.invalidate(id)
+  }
+
+  /**
+   * 重新计算 sys_user.is_tenant_admin：
+   * 用户在任意租户持有 role_code='admin' 的租户级角色（且仍是该租户有效成员）时为 1。
+   *
+   * 所有会改变「用户 ↔ 租户 admin 角色」绑定的写路径都要调用：
+   * assignRoles、TenantService.applyCreate / assignUsers。
+   */
+  async syncTenantAdminFlag(userId: string, em: EntityManager = this.repository.manager): Promise<void> {
+    const rows = await queryRaw<Array<{ one: number }>>(
+      em,
+      `SELECT 1 AS one
+         FROM sys_user_role ur
+         JOIN sys_role r ON r.id = ur.role_id
+         JOIN sys_user_tenant ut ON ut.user_id = ur.user_id AND ut.tenant_id = r.tenant_id AND ut.status = 0
+        WHERE ur.user_id = ? AND r.role_code = 'admin' AND r.tenant_id > 0
+        LIMIT 1`,
+      [userId]
+    )
+    await queryRaw(em, 'UPDATE sys_user SET is_tenant_admin = ? WHERE id = ?', [rows.length ? 1 : 0, userId])
+  }
+
+  /**
+   * 绑定部门
+   * - 入参顺序即主次顺序，第一个为主部门
+   * - 同步冗余：sys_user.depart_ids（逗号串）、sys_user.org_code（主部门机构编码）
+   */
+  async assignDepts(id: string, deptIds: string[], manager?: EntityManager): Promise<void> {
+    if (!manager) {
+      await this.findOne(id)
+    }
+    const repo = this.repoOf(manager)
+    const ids = [...new Set(deptIds.filter(Boolean))]
+    const depts = ids.length ? await this.deptRepository.find({ where: { id: In(ids), delFlag: '0' } }) : []
+    if (depts.length !== ids.length) {
+      const found = new Set(depts.map(dept => dept.id))
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, `部门不存在或已删除：${ids.filter(depId => !found.has(depId)).join(',')}`)
+    }
+    // 部门也是租户级资产：租户 A 的账号不能被绑到租户 B 的部门上（否则按部门的数据范围
+    // 会把 B 的组织结构带进 A 的可见范围）。平台共享部门（tenant_id=0）允许，与角色同口径。
+    const deptTenantId = TenantContext.filterTenantId()
+    if (deptTenantId !== null) {
+      const illegal = depts.filter(dept => {
+        const owner = Number(dept.tenantId ?? 0)
+        return owner !== 0 && owner !== deptTenantId
+      })
+      if (illegal.length) {
+        throw new BizException(
+          BizErrorCode.BUSINESS_ERROR,
+          `部门「${illegal.map(dept => dept.departName).join('、')}」不属于当前租户，不能分配`,
+          HttpStatus.BAD_REQUEST
+        )
+      }
+    }
+    const deptMap = new Map(depts.map(dept => [dept.id, dept]))
+    const ordered = ids.map(depId => deptMap.get(depId) as DeptEntity)
+
+    const current = await repo.createQueryBuilder().relation(UserEntity, 'depts').of(id).loadMany<DeptEntity>()
+    const currentIds = new Set(current.map(dept => dept.id))
+    const toAdd = ordered.filter(dept => !currentIds.has(dept.id))
+    const toRemove = current.filter(dept => !ids.includes(dept.id))
+    if (toAdd.length || toRemove.length) {
+      await repo.createQueryBuilder().relation(UserEntity, 'depts').of(id).addAndRemove(toAdd, toRemove)
+    }
+
+    await repo.update(id, {
+      departIds: ids.length ? ids.join(',') : null,
+      orgCode: ordered[0]?.orgCode ?? null,
+      updateTime: new Date()
+    })
+  }
+
+  /**
+   * 配置用户管辖部门（ReBAC 轻量版，全量覆盖）
+   *
+   * 存的是**已展开的有效部门**：入参部门 + 其所有子孙部门。查询期直接用 IN，
+   * 不做递归 SQL、也不依赖 req.user 带部门树，避免热路径开销。
+   * 部门树调整后需重新配置一次（同级其它账号不受影响）。
+   *
+   * 语义边界：
+   * - 只影响 data_scope=部门档(2/3) 的业务数据可见范围；仅本人(4) 仍只看自己；
+   * - 与「所属部门」（sys_user_depart）是两套关系，互不改写；
+   * - 租户级资产：不能授权本租户用户监管别的租户的部门（平台共享部门 tenant_id=0 允许）。
+   */
+  async assignSuperviseDepts(id: string, deptIds: string[], manager?: EntityManager): Promise<void> {
+    const em = manager ?? this.repository.manager
+    await this.findOne(id)
+    const clean = [...new Set(deptIds.filter(Boolean))]
+    const depts = clean.length ? await this.deptRepository.find({ where: { id: In(clean), delFlag: '0' } }) : []
+    if (depts.length !== clean.length) {
+      const found = new Set(depts.map(dept => dept.id))
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, `部门不存在或已删除：${clean.filter(depId => !found.has(depId)).join(',')}`)
+    }
+
+    const currentTenant = TenantContext.filterTenantId()
+    if (currentTenant !== null) {
+      const illegal = depts.filter(dept => {
+        const owner = Number(dept.tenantId ?? 0)
+        return owner !== 0 && owner !== currentTenant
+      })
+      if (illegal.length) {
+        throw new BizException(
+          BizErrorCode.BUSINESS_ERROR,
+          `部门「${illegal.map(dept => dept.departName).join('、')}」不属于当前租户，不能授权监管`,
+          HttpStatus.BAD_REQUEST
+        )
+      }
+    }
+
+    // 展开子孙：部门表量级小，一次带租户拉全量后内存 BFS（与 applyDataScope 的部门档同口径）
+    const allQb = this.deptRepository.createQueryBuilder('d').where('d.del_flag = :delFlag', { delFlag: '0' }).select(['d.id', 'd.parentId'])
+    applyTenantScope(allQb, 'd')
+    const all = await allQb.getMany()
+    const childrenOf = new Map<string, string[]>()
+    for (const dept of all) {
+      const parent = dept.parentId ?? ''
+      if (!parent) continue
+      const list = childrenOf.get(parent) ?? []
+      list.push(dept.id)
+      childrenOf.set(parent, list)
+    }
+    const effective = new Set(clean)
+    const walk = (deptId: string) => {
+      for (const child of childrenOf.get(deptId) ?? []) {
+        if (!effective.has(child)) {
+          effective.add(child)
+          walk(child)
+        }
+      }
+    }
+    for (const rootId of clean) walk(rootId)
+
+    const tenantId = currentTenant === null ? 0 : Number(currentTenant)
+    const writeScope = tenantWriteSql(tenantId, 'tenant_id')
+    const existing = await queryRaw<Array<{ dept_id: string }>>(em, `SELECT dept_id FROM sys_user_supervise_dept WHERE user_id = ? ${writeScope.clause}`, [
+      id,
+      ...writeScope.params
+    ])
+    const existingIds = new Set(existing.map(row => row.dept_id))
+    const toRemove = [...existingIds].filter(deptId => !effective.has(deptId))
+    const toAdd = [...effective].filter(deptId => !existingIds.has(deptId))
+    if (toRemove.length) {
+      const placeholders = toRemove.map(() => '?').join(',')
+      await queryRaw(em, `DELETE FROM sys_user_supervise_dept WHERE user_id = ? ${writeScope.clause} AND dept_id IN (${placeholders})`, [
+        id,
+        ...writeScope.params,
+        ...toRemove
+      ])
+    }
+    for (const deptId of toAdd) {
+      await queryRaw(em, `${sqlInsertIgnorePrefix()} sys_user_supervise_dept (id, user_id, dept_id, tenant_id) VALUES (?, ?, ?, ?)${sqlInsertIgnoreSuffix()}`, [
+        randomId32(),
+        id,
+        deptId,
+        tenantId
+      ])
+    }
+    if (toAdd.length || toRemove.length) {
+      this.authUserCache.invalidate(id)
+    }
+  }
+
+  /** 读取用户当前租户下被授权监管的部门 id（findOneWithRoles 挂载用） */
+  /**
+   * 读取用户当前租户下被授权监管的部门 id（管理端「管辖部门」配置回显用）。
+   * 与 findOneWithRoles 的挂载逻辑同一实现，但独立暴露：详情接口不挂这个字段，
+   * 避免所有详情响应都多一次查询。
+   */
+  async listSuperviseDeptIds(userId: string): Promise<string[]> {
+    return this.loadSuperviseDeptIds(userId)
+  }
+
+  private async loadSuperviseDeptIds(userId: string): Promise<string[]> {
+    const currentTenant = TenantContext.filterTenantId()
+    const scope = currentTenant === null ? null : Number(currentTenant)
+    const qb = this.superviseRepository.createQueryBuilder('s').select('s.deptId', 'deptId').where('s.userId = :userId', { userId })
+    if (scope !== null) {
+      qb.andWhere('(s.tenantId = 0 OR s.tenantId = :tenantId)', { tenantId: scope })
+    }
+    const rows = await qb.getRawMany<{ deptId: string }>()
+    return rows.map(row => row.deptId).filter(Boolean)
+  }
+
+  /** 绑定岗位；岗位不存在时整体拒绝 */
+  async assignPosts(id: string, postIds: string[], manager?: EntityManager): Promise<void> {
+    if (!manager) {
+      await this.findOne(id)
+    }
+    const repo = this.repoOf(manager)
+    const ids = [...new Set(postIds.filter(Boolean))]
+    const posts = ids.length ? await this.postRepository.find({ where: { id: In(ids) } }) : []
+    if (posts.length !== ids.length) {
+      const found = new Set(posts.map(post => post.id))
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, `岗位不存在：${ids.filter(postId => !found.has(postId)).join(',')}`)
+    }
+    // 岗位同样是租户级资产，理由同 assignDepts（共享岗位 tenant_id=0 例外）
+    const postTenantId = TenantContext.filterTenantId()
+    if (postTenantId !== null) {
+      const illegal = posts.filter(post => {
+        const owner = Number(post.tenantId ?? 0)
+        return owner !== 0 && owner !== postTenantId
+      })
+      if (illegal.length) {
+        throw new BizException(
+          BizErrorCode.BUSINESS_ERROR,
+          `岗位「${illegal.map(post => post.postName).join('、')}」不属于当前租户，不能分配`,
+          HttpStatus.BAD_REQUEST
+        )
+      }
+    }
+    const current = await repo.createQueryBuilder().relation(UserEntity, 'posts').of(id).loadMany<PostEntity>()
+    const currentIds = new Set(current.map(post => post.id))
+    const toAdd = posts.filter(post => !currentIds.has(post.id))
+    const toRemove = current.filter(post => !ids.includes(post.id))
+    if (toAdd.length || toRemove.length) {
+      await repo.createQueryBuilder().relation(UserEntity, 'posts').of(id).addAndRemove(toAdd, toRemove)
+    }
+  }
+
+  /** 事务内使用的用户仓库（不传 manager 时走默认连接） */
+  private repoOf(manager?: EntityManager): Repository<UserEntity> {
+    return manager ? manager.getRepository(UserEntity) : this.repository
+  }
+
+  /**
+   * 多步写在同一个事务里执行，并把唯一键冲突翻译成业务提示
+   *
+   * 为什么必须翻译：并发创建同名账号时前置查重必然漏网，MySQL 会抛 Duplicate entry，
+   * 不处理就变成 500「服务器内部错误」，用户完全不知道该改什么。
+   */
+  private async runInTransaction<T>(work: (manager: EntityManager) => Promise<T>): Promise<T> {
+    try {
+      return await this.repository.manager.transaction(work)
+    } catch (error) {
+      if (isDuplicateEntryError(error)) {
+        // 与角色/字典模块保持一致：唯一键冲突属于「参数问题」，用 400 而非 500
+        throw new BadRequestException(describeDuplicateEntry(error) ?? '数据重复，请检查后重试')
+      }
+      throw error
+    }
+  }
+
+  /**
+   * 唯一性预检（对齐数据库唯一索引 sys_user.username / phone / email / work_no）
+   * - 软删除记录**仍然占用**唯一索引，所以不加 del_flag 过滤，并在提示里说明怎么处理
+   * - excludeId：更新时排除自己，否则「只改姓名」也会被判成冲突
+   */
+  private async assertUniqueFields(data: Partial<UserEntity>, excludeId?: string): Promise<void> {
+    const rules: Array<{ field: 'username' | 'phone' | 'email' | 'workNo'; label: string }> = [
+      { field: 'username', label: '登录账号' },
+      { field: 'phone', label: '手机号' },
+      { field: 'email', label: '邮箱' },
+      { field: 'workNo', label: '工号' }
+    ]
+    for (const rule of rules) {
+      // 账号创建后不可修改，更新时不需要校验
+      if (rule.field === 'username' && excludeId) {
+        continue
+      }
+      const raw = data[rule.field]
+      const value = typeof raw === 'string' ? raw.trim() : ''
+      if (!value) {
+        continue
+      }
+      const where = { [rule.field]: value, ...(excludeId ? { id: Not(excludeId) } : {}) } as FindOptionsWhere<UserEntity>
+      const existing = await this.repository.findOne({ where })
+      if (!existing) {
+        continue
+      }
+      if (rule.field === 'username') {
+        throw new BadRequestException(
+          existing.delFlag === 1
+            ? `登录账号「${value}」已被一个已删除的账号占用（唯一索引不随软删除释放），请换一个账号或先恢复原账号`
+            : `登录账号「${value}」已存在，请换一个`
+        )
+      }
+      throw new BadRequestException(`${rule.label}「${value}」已被账号「${existing.username}」占用，请修改后再提交`)
+    }
+  }
+
+  /**
+   * 分页列表：支持 keyword 前缀搜索账号/真实姓名/电话、status 精确过滤、部门过滤；过滤已软删；按数据范围收窄
+   *
+   * skipCount=true 时跳过 COUNT(*)：千万行表上它是全索引扫描（实测 17.8 秒），
+   * 而列表页只需要「还有没有下一页」，多取 1 条就能判断。
+   */
+  async listByQuery(query: QueryUserDto, actor?: DataScopeActor): Promise<Pagination<UserEntity>> {
+    const options: PaginateOptions = { page: query.page, pageSize: query.pageSize, count: query.skipCount !== 'true' }
+    const result = await paginate(await this.buildListQuery(query, actor), options)
+    await this.attachDepts(result.records)
+    await this.attachRoles(result.records)
+    await this.attachPosts(result.records)
+    await this.attachLevel(result.records)
+    await this.attachWatermark(result.records)
+    return result
+  }
+
+  /** 导出用户：与列表同过滤条件、不分页（上限 USER_EXPORT_MAX_ROWS），带部门与角色 */
+  async exportUsers(query: QueryUserDto, actor?: DataScopeActor): Promise<UserEntity[]> {
+    const users = await (await this.buildListQuery(query, actor)).take(USER_EXPORT_MAX_ROWS).getMany()
+    await this.attachDepts(users)
+    await this.attachRoles(users)
+    await this.attachPosts(users)
+    await this.attachLevel(users)
+    await this.attachWatermark(users)
+    return users
+  }
+
+  /**
+   * 所有「按数据范围收窄」的用户查询的唯一入口：软删过滤 + dataScope 都只在这一处拼。
+   *
+   * 为什么不各自 createQueryBuilder：首页的用户总数、列表、导出三个口径必须完全一致，
+   * 分开写迟早会漂（软删没滤、dataScope 漏加），同一张卡片和列表页对不上数字就是事故。
+   */
+  private async scopedQuery(actor?: DataScopeActor): Promise<SelectQueryBuilder<UserEntity>> {
+    const qb = this.repository.createQueryBuilder('user').where('user.del_flag = 0')
+    this.applyTenantToUsers(qb)
+    await this.applyDataScope(qb, actor)
+    return qb
+  }
+
+  /**
+   * 用户表的租户收窄（sys_user 本身没有 tenant_id，归属靠 sys_user_tenant）
+   *
+   * 为什么用户表不隔离却要过滤：账号是全局身份（一人可属多租户，靠关系表表达归属），
+   * 但「用户管理」页在租户 A 下只该列 A 的用户 —— 否则租户管理员能翻到全平台手机号/邮箱。
+   * 平台视角（tenantId=null）不过滤；没有租户归属（0）一条都看不到。
+   */
+  private applyTenantToUsers(qb: SelectQueryBuilder<UserEntity>): void {
+    const tenantId = TenantContext.filterTenantId()
+    if (tenantId === null) return
+    if (tenantId === 0) {
+      qb.andWhere('1 = 0')
+      return
+    }
+    qb.andWhere('EXISTS (SELECT 1 FROM `sys_user_tenant` ut WHERE ut.`user_id` = user.id AND ut.`tenant_id` = :scopeTenantId AND ut.`status` = 0)', {
+      scopeTenantId: tenantId
+    })
+  }
+
+  /**
+   * 统计当前账号可见的用户数（首页指标卡用）
+   *
+   * 与 listByQuery 共用 scopedQuery，因此软删过滤与数据范围完全同口径：
+   * 同样的账号看到的「用户总数」和用户列表的 total 永远一致。
+   */
+  async countScoped(actor?: DataScopeActor): Promise<{ total: number; active: number; frozen: number }> {
+    const row = await (
+      await this.scopedQuery(actor)
+    )
+      .select('COUNT(1)', 'total')
+      .addSelect(`COALESCE(${sqlSumIf('user.status = 1')}, 0)`, 'active')
+      .addSelect(`COALESCE(${sqlSumIf('user.status = 2')}, 0)`, 'frozen')
+      .getRawOne<{ total: string | number; active: string | number; frozen: string | number }>()
+    return {
+      total: Number(row?.total ?? 0),
+      active: Number(row?.active ?? 0),
+      frozen: Number(row?.frozen ?? 0)
+    }
+  }
+
+  /** 列表/导出共用的查询构造：过滤条件集中一处，避免导出和列表口径跑偏 */
+  private async buildListQuery(query: QueryUserDto, actor?: DataScopeActor): Promise<SelectQueryBuilder<UserEntity>> {
+    const qb = (await this.scopedQuery(actor)).orderBy('user.create_time', 'DESC')
+    // 表头排序走白名单：排序列 + id 兜底，保证深翻页时行序稳定
+    applySort(qb, 'user', query, USER_SORTABLE)
+
+    if (query.keyword) {
+      qb.andWhere(userKeywordClause('user', query.keyword), { keyword: userKeywordParam(query.keyword) })
+    }
+    if (query.status !== undefined && query.status !== '') {
+      qb.andWhere('user.status = :status', { status: Number(query.status) })
+    }
+    // 部门过滤：命中 sys_user_depart 任一部门即返回（deptId 与 deptIds 取并集）
+    const deptFilters = [
+      ...(query.deptId ? [query.deptId] : []),
+      ...(query.deptIds
+        ? query.deptIds
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean)
+        : [])
+    ]
+    if (deptFilters.length) {
+      qb.andWhere('EXISTS (SELECT 1 FROM `sys_user_depart` ud WHERE ud.`user_id` = user.id AND ud.`dep_id` IN (:...deptFilters))', {
+        deptFilters
+      })
+    }
+    return qb
+  }
+
+  /**
+   * 数据范围过滤（sys_role.data_scope）：
+   *  - 超管角色不受限；多角色取「可见范围最大」的档（数值最小）
+   *  - 全部(1) → 不加任何过滤；仅本人(4) → user.id = 自己；
+   *    本部门(3) → 命中自己任一部门；本部门及以下(2) → 部门树递归展开
+   *  - 用户没有任何部门时，「本部门」档看不到任何人（1=0），避免误放成全量
+   */
+  /**
+   * 参与数据范围计算的角色：只算**当前租户**的角色（+ 平台共享角色）。
+   *
+   * 同一个账号在 A 租户是管理员(data_scope=1)、在 B 租户是访客(data_scope=4)，
+   * 若把两边的角色一起取 Math.min，在 B 也会得到 1 = 看全部数据。
+   * JwtStrategy 已经把 req.user.roles 收窄过，这里是第二道（Dashboard 等自己拼 actor 的路径）。
+   */
+  private scopedRoles(roles: RoleEntity[]): RoleEntity[] {
+    const tenantId = TenantContext.filterTenantId()
+    if (tenantId === null) return roles
+    return roles.filter(role => {
+      const owner = Number(role.tenantId ?? 0)
+      return owner === 0 || owner === tenantId
+    })
+  }
+
+  private async applyDataScope(qb: SelectQueryBuilder<UserEntity>, actor?: DataScopeActor): Promise<void> {
+    const roles = actor?.roles ?? []
+    // 平台管理员不受数据范围限制（按 is_platform_admin 判定，不看 role_code：角色是租户级的）
+    if (!actor || Number(actor.isPlatformAdmin ?? 0) === 1) {
+      return
+    }
+    const scopes = this.scopedRoles(roles).map(role => role.dataScope ?? DATA_SCOPE.ALL)
+    if (!scopes.length) {
+      return
+    }
+    const scope = Math.min(...scopes)
+    // 全部(1)：语义就是不过滤。之前漏了这一档，导致「全部」的角色反而被自己的部门收窄，
+    // 没挂部门的账号直接 1=0 看不到任何人（有 system:user:list 的审计员看到空用户列表就是这个原因）
+    if (scope === DATA_SCOPE.ALL) {
+      return
+    }
+    if (scope >= DATA_SCOPE.SELF_ONLY) {
+      qb.andWhere('user.id = :scopeSelfId', { scopeSelfId: actor.id })
+      return
+    }
+    const ownDeptIds = (actor.departIds ?? '')
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean)
+    if (!ownDeptIds.length) {
+      qb.andWhere('1 = 0')
+      return
+    }
+    let deptIds = ownDeptIds
+    if (scope === DATA_SCOPE.DEPT_AND_CHILDREN) {
+      // 部门表量级小（组织架构），一次性载入内存做父子展开，避免递归 SQL。
+      // 必须按当前租户收窄：全表载入会把别家租户挂在同名父节点下的部门也展开进来。
+      const deptQb = this.deptRepository.createQueryBuilder('d').where('d.del_flag = :delFlag', { delFlag: '0' }).select(['d.id', 'd.parentId'])
+      applyTenantScope(deptQb, 'd')
+      const all = await deptQb.getMany()
+      const childrenOf = new Map<string, string[]>()
+      for (const dept of all) {
+        if (!dept.parentId) continue
+        childrenOf.set(dept.parentId, [...(childrenOf.get(dept.parentId) ?? []), dept.id])
+      }
+      const queue = [...ownDeptIds]
+      const seen = new Set(ownDeptIds)
+      while (queue.length) {
+        const parent = queue.pop() as string
+        for (const child of childrenOf.get(parent) ?? []) {
+          if (!seen.has(child)) {
+            seen.add(child)
+            queue.push(child)
+          }
+        }
+      }
+      deptIds = [...seen]
+    }
+    qb.andWhere('EXISTS (SELECT 1 FROM `sys_user_depart` ud2 WHERE ud2.`user_id` = user.id AND ud2.`dep_id` IN (:...scopeDeptIds))', {
+      scopeDeptIds: deptIds
+    })
+  }
+
+  /* ---------- 个人资料自助（/v1/users/me） ---------- */
+
+  /** 我的资料：带角色 / 部门 / 岗位 / 职级 / 水印，只查自己 —— 不需要 system:user:list 权限 */
+  async findMyProfile(id: string): Promise<UserEntity> {
+    return this.findOneDetail(id)
+  }
+
+  /**
+   * 自助更新个人资料
+   *
+   * 白名单写库：姓名 / 邮箱 / 手机号 / 座机 / 性别 / 生日 / 简介。
+   * DTO 层已经挡了一次（whitelist 会丢掉 roleIds、status 之类的多余键），这里再列一遍，
+   * 防止以后有人往 DTO 里加字段就顺带拿到了越权改状态的入口。
+   *
+   * 两个坑：
+   * 1. email / phone 在库上有唯一索引，且**回收站里的账号也占着**，所以写入前必须前置查重；
+   * 2. 空串要归一成 NULL —— 唯一索引下多个空串会互相冲突，而且 '' 与 null 在页面上没区别。
+   */
+  async updateMyProfile(id: string, dto: UpdateMyProfileDto): Promise<UserEntity> {
+    await this.findOne(id) // 不存在 / 已软删 → 404
+
+    // 改邮箱必须验证密码：邮箱是「忘记密码」的收件凭证，只凭会话就能改邮箱的话，
+    // 被盗 token 可以把邮箱换成攻击者的 → 再走 forgot 链路接管整个账号
+    if (dto.email !== undefined && String(dto.email).trim() !== '') {
+      const withPassword = await this.findOneWithPassword(id)
+      if (!withPassword || !dto.password || !(await this.verifyPassword(withPassword, dto.password))) {
+        throw new BizException(BizErrorCode.BUSINESS_ERROR, '修改邮箱需要验证当前密码，请输入密码后重试', HttpStatus.BAD_REQUEST)
+      }
+    }
+
+    const patch: Record<string, string | number | null> = {}
+    const assignText = (field: 'realname' | 'email' | 'phone' | 'telephone' | 'bio', value?: string | null) => {
+      if (value === undefined) return
+      const text = String(value ?? '').trim()
+      patch[field] = text === '' ? null : text
+    }
+    assignText('realname', dto.realname)
+    assignText('email', dto.email)
+    assignText('phone', dto.phone)
+    assignText('telephone', dto.telephone)
+    assignText('bio', dto.bio)
+
+    if (dto.birthday !== undefined) {
+      // 归一成 YYYY-MM-DD；normalizeDateText 认 1990/1/1、1990.1.1，非法值让它原样入库由数据库报错
+      patch.birthday = dto.birthday ? (normalizeDateText(dto.birthday) ?? dto.birthday) : null
+    }
+    if (dto.sex !== undefined) {
+      patch.sex = dto.sex
+    }
+    if (!Object.keys(patch).length) {
+      return this.findOneDetail(id)
+    }
+
+    await this.assertMyProfileUnique(id, patch)
+    try {
+      await this.repository
+        .createQueryBuilder()
+        .update(UserEntity)
+        .set(patch as QueryDeepPartialEntity<UserEntity>)
+        .where('id = :id', { id })
+        .execute()
+    } catch (error) {
+      throw new BadRequestException(describeWriteError(error))
+    }
+    return this.findOneDetail(id)
+  }
+
+  /** 自助改资料时的唯一键前置查重：邮箱 / 手机号被别的账号（含回收站）占用就报中文错 */
+  private async assertMyProfileUnique(id: string, patch: Record<string, string | number | null>): Promise<void> {
+    const checks: Array<['email' | 'phone', string]> = [
+      ['email', '邮箱'],
+      ['phone', '手机号']
+    ]
+    for (const [field, label] of checks) {
+      const value = patch[field]
+      if (!value) continue
+      const owner = await this.repository.findOne({
+        where: { [field]: value } as FindOptionsWhere<UserEntity>,
+        select: { id: true, username: true, delFlag: true }
+      })
+      if (owner && owner.id !== id) {
+        throw new BadRequestException(`${label}「${value}」已被账号「${owner.username}」占用${owner.delFlag === 1 ? '（该账号在回收站）' : ''}`)
+      }
+    }
+  }
+
+  /** 单查覆盖：过滤已软删用户；**写路径语义** —— 租户视角只能命中本租户（sys_user_tenant 有归属记录）的账号 */
+  async findOne(id: string): Promise<UserEntity> {
+    // 严格租户条件（applyTenantToUsers）：平台视角不过滤。之前这里不带租户条件，
+    // update/delete/resetPassword/setStatus/批量全部先走 findOne 再按 id 写 ——
+    // 租户管理员拿任意 id 就能接管别家租户的账号（跨租户用户接管链）。
+    const qb = this.repository.createQueryBuilder('user').where('user.id = :id', { id }).andWhere('user.del_flag = 0')
+    this.applyTenantToUsers(qb)
+    const user = await qb.getOne()
+    if (!user) {
+      throw new NotFoundException('用户不存在')
+    }
+    return user
+  }
+
+  /**
+   * 批量按 id 取「本租户可写」的账号（与 findOne 同语义）：给批量操作的 find 用。
+   * 租户视角严格只命中 sys_user_tenant 有归属记录的账号；平台视角（null）不过滤。
+   */
+  private async findWritableByIds(ids: string[]): Promise<UserEntity[]> {
+    const qb = this.repository.createQueryBuilder('user').where('user.id IN (:...ids)', { ids }).andWhere('user.del_flag = 0')
+    this.applyTenantToUsers(qb)
+    return qb.getMany()
+  }
+
+  /** 按 id 查找并带出角色（过滤已软删）；同时挂载「管辖部门」集合供业务数据级权限使用 */
+  async findOneWithRoles(id: string): Promise<UserEntity | null> {
+    const user = await this.repository.findOne({ where: { id, delFlag: 0 }, relations: { roles: true, depts: true, posts: true } })
+    if (user) {
+      this.applyDepts(user)
+      // 热路径多一次轻量索引查询（仅 id 列 + 30s 用户缓存摊薄）。
+      // 不挂到 UserEntity 列上：它是权限上下文，不是用户资料，避免随用户接口外泄。
+      ;(user as UserEntity & { superviseDeptIds?: string[] }).superviseDeptIds = await this.loadSuperviseDeptIds(id)
+    }
+    return user
+  }
+
+  /** 按 id 查找并带出角色及其授权的菜单/按钮（权限接口用，过滤已软删） */
+  async findOneWithRolePermissions(id: string): Promise<UserEntity | null> {
+    const user = await this.repository.findOne({
+      where: { id, delFlag: 0 },
+      relations: { roles: { permissions: true }, depts: true }
+    })
+    if (user) {
+      this.applyDepts(user)
+    }
+    return user
+  }
+
+  /** 批量按 ID 查账号（「选人」控件回显用，过滤已软删）：只吐 id/账号/姓名，单次最多 USER_LOOKUP_MAX_IDS 个 */
+  async lookupBrief(ids: string[]): Promise<Array<{ id: string; username: string; realname?: string }>> {
+    const clean = Array.from(new Set(ids.map(id => id.trim()).filter(Boolean))).slice(0, USER_LOOKUP_MAX_IDS)
+    if (!clean.length) return []
+    // 选人控件也要按租户收窄，否则任务指派/站内信能选到别的租户的账号
+    const qb = this.repository
+      .createQueryBuilder('user')
+      .select(['user.id', 'user.username', 'user.realname'])
+      .where('user.id IN (:...ids)', { ids: clean })
+      .andWhere('user.del_flag = 0')
+    this.applyTenantToUsers(qb)
+    const rows = await qb.getMany()
+    return rows.map(row => ({ id: row.id, username: row.username, realname: row.realname ?? undefined }))
+  }
+
+  /**
+   * 批量确认用户存在（过滤已软删），给「批量业务」跳过无效目标用
+   *
+   * 只回 id + 账号：批量接口只需要知道谁在执行范围内、跳过的是谁，
+   * 不关心完整资料；也不做 100 条截断（批量上限由调用方的 DTO 控制）。
+   * 同样按租户收窄：别的租户的用户在这里等于「不存在」，批量操作会给出「用户不存在或已删除」。
+   */
+  async findExistingBriefs(ids: string[]): Promise<Array<{ id: string; username: string }>> {
+    const clean = Array.from(new Set(ids.map(id => String(id ?? '').trim()).filter(Boolean)))
+    if (!clean.length) return []
+    const qb = this.repository
+      .createQueryBuilder('user')
+      .select(['user.id', 'user.username'])
+      .where('user.id IN (:...ids)', { ids: clean })
+      .andWhere('user.del_flag = 0')
+    this.applyTenantToUsers(qb)
+    return qb.getMany()
+  }
+
+  /** 详情：带出角色 + 部门 + 岗位（过滤已软删，不存在抛 404），并做租户可见性断言 */
+  async findOneDetail(id: string): Promise<UserEntity> {
+    const user = await this.findOneDetailForAuth(id)
+    // 跨租户按「不存在」处理，不泄漏账号是否存在
+    await this.assertUserVisible(id)
+    return user
+  }
+
+  /**
+   * 认证流程专用的详情查询（refreshToken 换发等）：不做租户可见性断言。
+   *
+   * 为什么单独抽出来：refresh 请求按设计不带 accessToken（访问令牌此时往往已过期），
+   * 租户中间件对无令牌请求给 tenantId=0 的空上下文，assertUserVisible 会把任何人
+   * 都判成「用户不存在」（1=0），导致续期必然失败。令牌已验签，这里的 id 可信，
+   * 不需要再按租户收窄——管理端语义的可见性断言只属于 findOneDetail。
+   */
+  async findOneDetailForAuth(id: string): Promise<UserEntity> {
+    const user = await this.repository.findOne({ where: { id, delFlag: 0 }, relations: { roles: true, depts: true, posts: true } })
+    if (!user) {
+      throw new NotFoundException('用户不存在')
+    }
+    this.applyDepts(user)
+    await this.attachLevel([user])
+    await this.attachWatermark([user])
+    return user
+  }
+
+  /** 当前租户能否看到该用户（平台视角恒 true） */
+  private async assertUserVisible(id: string): Promise<void> {
+    const tenantId = TenantContext.filterTenantId()
+    if (tenantId === null) return
+    const qb = this.repository.createQueryBuilder('user').where('user.id = :id', { id })
+    this.applyTenantToUsers(qb)
+    if ((await qb.getCount()) === 0) {
+      throw new NotFoundException('用户不存在')
+    }
+  }
+  /** 按 id 查找（含密码与盐，仅供认证场景使用；过滤已软删） */
+  async findOneWithPassword(id: string): Promise<UserEntity | null> {
+    return this.repository
+      .createQueryBuilder('user')
+      .addSelect(['user.password', 'user.salt'])
+      .where('user.id = :id', { id })
+      .andWhere('user.del_flag = 0')
+      .getOne()
+  }
+
+  /**
+   * 只取两步验证状态（SSO 登录门禁用）
+   * totpSecret 是 select:false，必须显式 addSelect，否则门禁会静默失效
+   */
+  async findTotpState(id: string): Promise<{ totpEnabled: number; totpSecret: string | null } | null> {
+    const user = await this.repository
+      .createQueryBuilder('user')
+      .addSelect(['user.totpSecret', 'user.totpEnabled'])
+      .where('user.id = :id', { id })
+      .andWhere('user.del_flag = 0')
+      .getOne()
+    return user ? { totpEnabled: Number(user.totpEnabled ?? 0), totpSecret: user.totpSecret ?? null } : null
+  }
+
+  /** 按用户名查找并带出角色、部门（登录用，密码与盐显式加查；过滤已软删） */ async findByUsername(username: string): Promise<UserEntity | null> {
+    const user = await this.repository
+      .createQueryBuilder('user')
+      // totp 两列是 select:false（防密钥随接口外泄），登录门禁要读，认证专用查询里显式带回
+      .addSelect(['user.password', 'user.salt', 'user.totpSecret', 'user.totpEnabled'])
+      .leftJoinAndSelect('user.roles', 'role')
+      .leftJoinAndSelect('user.depts', 'dept')
+      .where('user.username = :username', { username })
+      .andWhere('user.del_flag = 0')
+      .getOne()
+    if (user) {
+      this.applyDepts(user)
+    }
+    return user
+  }
+
+  /** 软删除（对齐 sys_user.del_flag）：置 del_flag=1 而非物理删除；admin 不可删除 */
+  async delete(id: string): Promise<void> {
+    const user = await this.findOne(id)
+    if (user.username === 'admin') {
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, '内置管理员账号不允许删除')
+    }
+    // 先取归属租户：事务里会清掉 sys_user_tenant，之后再查就拿不到 webhook 事件的租户了
+    const tenantRows = await queryRaw<Array<{ tenant_id: number }>>(
+      this.repository,
+      'SELECT tenant_id FROM sys_user_tenant WHERE user_id = ? AND status = 0 ORDER BY id LIMIT 1',
+      [id]
+    )
+    await this.runInTransaction(async manager => {
+      // 关联表必须跟着清：sys_user_role / sys_user_depart 不会随软删失效，
+      // 不清会出现两个后果：① 角色删除保护把已删用户算成「还有 N 个用户」，角色永久删不掉；
+      // ② 将来恢复账号时旧角色/旧部门「自动复活」，权限状态不可控。
+      await queryRaw(manager, 'DELETE FROM sys_user_role WHERE user_id = ?', [id])
+      await queryRaw(manager, 'DELETE FROM sys_user_depart WHERE user_id = ?', [id])
+      await queryRaw(manager, 'DELETE FROM sys_user_post WHERE user_id = ?', [id])
+      // 租户归属也要清：否则软删用户会一直占着租户名额，租户删除接口永远提示「还有用户」，
+      // 而用户列表又因为 del_flag=1 看不到这些人，管理员没有任何入口清理。
+      await queryRaw(manager, 'DELETE FROM sys_user_tenant WHERE user_id = ?', [id])
+      // 水印个性化配置同样按 user_id 主键，不清会在表里越积越多
+      await queryRaw(manager, 'DELETE FROM sys_user_watermark WHERE user_id = ?', [id])
+      // 界面设置**刻意不清**：软删是可恢复的，回复后就是同一个人，主题/字号丢了不可逆；
+      // 而且它只是个人偏好，不像角色/水印那样有「恢复后必须重新确认」的安全含义。
+      // 回收站里多留一行不影响任何按主键的查询，真正的清理交给将来的「回收站到期物理删除」。
+      await this.repoOf(manager).update(id, { delFlag: 1, departIds: null, orgCode: null, isTenantAdmin: 0 })
+    })
+    // 删号即失效：缓存里若还留着这个人，鉴权会继续放行到下次过期
+    this.authUserCache.invalidate(id)
+    this.tenantAccess.invalidate(id)
+    // 开放平台事件：软删也通知（订阅方一般用于同步通讯录/回收站）
+    // 事件归属租户：取删除前的主归属（拿不到就按 0 平台事件，只发平台级订阅）
+    this.webhookService.dispatch('user.deleted', { id, username: user.username }, { tenantId: Number(tenantRows?.[0]?.tenant_id ?? 0) })
+  }
+
+  /** 批量删除用户：逐条走 delete，保留「内置管理员不可删」的保护并收集原因 */
+  async batchDelete(ids: string[]): Promise<BatchDeleteResult> {
+    const targets = await this.findWritableByIds(normalizeBatchIds(ids))
+    return runBatchDelete(
+      targets,
+      {
+        getId: user => user.id,
+        getName: user => user.realname || user.username,
+        remove: user => this.delete(user.id)
+      },
+      ids
+    )
+  }
+
+  /* ---------- 管理操作：重置密码 / 冻结 / 强制下线 / 解锁 / 回收站 ---------- */
+
+  /**
+   * 重置密码：管理端指定新密码，或留空生成 12 位易读随机口令
+   * 明文只出现在本次返回值里（随响应一次性下发），库中只存 argon2id 哈希；
+   * 重置后该用户全部在线会话立即失效（旧密码可能已泄露的假设下不能让旧登录态续命）
+   */
+  async resetPassword(id: string, plainPassword?: string): Promise<{ password: string }> {
+    const user = await this.findOne(id)
+    const password = plainPassword?.trim() || randomToken(12)
+    // 管理员手填的临时口令同样要过策略：否则「重置成 123456」会让全站密码基线形同虚设
+    await this.assertPassword(password, user.username)
+    await this.updatePasswordOnly(id, password)
+    // 管理员重置的密码视为临时口令：强制用户下次登录自行改密（安全基线）
+    await this.repository.update(id, { mustChangePassword: 1 })
+    await this.onlineService.kickUser(id)
+    return { password }
+  }
+
+  /**
+   * 只改密码哈希（自助改密与重置密码共用）：
+   * - argon2id 自带盐，顺手清历史盐
+   * - 按策略重算过期时间，并解除「强制改密」标记（刚改完不该再被拦一次）
+   */
+  async updatePasswordOnly(id: string, plainPassword: string): Promise<void> {
+    await this.repository.update(id, {
+      password: await hashPassword(plainPassword),
+      salt: null,
+      passwordExpireAt: await this.resolvePasswordExpireAt(),
+      mustChangePassword: 0,
+      updateTime: new Date()
+    })
+  }
+
+  /** 按当前策略校验密码强度；auth 的自助改密复用这个方法，保证口径一致 */
+  async assertPassword(plainPassword: string, username?: string): Promise<void> {
+    const policy = await this.systemConfig.getPasswordPolicy()
+    assertPasswordStrength(plainPassword, policy, username)
+  }
+
+  /** 按策略算密码过期时间：expireDays <= 0 表示永不过期（返回 null） */
+  private async resolvePasswordExpireAt(): Promise<Date | null> {
+    const days = await this.systemConfig.getNumber('security.password.expireDays', 90)
+    return days > 0 ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null
+  }
+
+  /** 自助改密成功后调用：只解除「强制改密」标记（过期时间已由 updatePasswordOnly 重算） */
+  async clearPasswordFlags(id: string): Promise<void> {
+    await this.repository.update(id, { mustChangePassword: 0 })
+  }
+
+  /** 用户是否命中「强制改密」：管理员显式标记，或密码已过有效期 */
+  async needsPasswordChange(user: Pick<UserEntity, 'mustChangePassword' | 'passwordExpireAt'>): Promise<boolean> {
+    if (user.mustChangePassword === 1) {
+      return true
+    }
+    return !!user.passwordExpireAt && user.passwordExpireAt.getTime() <= Date.now()
+  }
+
+  /**
+   * 冻结/解冻：1 正常 / 2 冻结
+   * - 内置 admin 不允许冻结（没有其他管理员时会把整个系统锁死）
+   * - 冻结时用户级拉黑 + 删除全部在线会话：JWT 每次请求会查库看到 status，但已签发的
+     refreshToken 轮换不查库，必须靠黑名单立即掐断
+   */
+  async setStatus(id: string, status: number): Promise<{ status: number; kicked: number }> {
+    const user = await this.findOne(id)
+    if (user.username === 'admin' && status !== USER_STATUS.NORMAL) {
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, '内置管理员账号不允许冻结')
+    }
+    if (status !== USER_STATUS.NORMAL && status !== USER_STATUS.FROZEN) {
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, '状态只允许 1（正常）或 2（冻结）')
+    }
+    await this.repository.update(id, { status, updateTime: new Date() })
+    // 冻结要立刻挡住：不清缓存的话，被冻结账号在 30s 内还能用旧缓存通过鉴权
+    this.authUserCache.invalidate(id)
+    const kicked = status === USER_STATUS.FROZEN ? await this.onlineService.kickUser(id) : 0
+    return { status, kicked }
+  }
+
+  /**
+   * 授予 / 取消平台管理员
+   *
+   * 为什么必须单独一个端点、且不能并进通用更新：`is_platform_admin` 是「租户层 / 平台层」的唯一分界，
+   * 一旦能被普通资料更新写入，任何持有 `system:user:update` 的租户管理员都能把自己提成平台超管。
+   *
+   * 三重门：① 权限点 `system:user:platform` 的 scope=platform，由 PermsGuard 先要求 is_platform_admin；
+   * ② 这里再核一次 actor（防止别的 service 内部调用绕开守卫）；
+   * ③ 不能取消自己、不能取消最后一个（否则平台层没人能管，且没有自助恢复的入口）。
+   *
+   * 生效时延：JwtStrategy 对鉴权用户有 30s 内存缓存，改完最多 30s 生效（与角色变更同语义）。
+   */
+  async setPlatformAdmin(id: string, enabled: boolean, actor: { id: string; username?: string; isPlatformAdmin?: number }): Promise<UserEntity> {
+    if (Number(actor.isPlatformAdmin) !== 1) {
+      throw new ForbiddenException('只有平台管理员可以调整平台管理员权限')
+    }
+    const user = await this.findOne(id)
+    if ((Number(user.isPlatformAdmin) === 1) === enabled) {
+      // 幂等：重复授予/重复取消直接返回，不写库也不产生日志噪音
+      return this.findOneDetail(id)
+    }
+    if (!enabled) {
+      if (id === actor.id) {
+        throw new BadRequestException('不能取消自己的平台管理员权限，请由其他平台管理员操作')
+      }
+      const remaining = await this.repository.count({ where: { isPlatformAdmin: 1, delFlag: 0 } })
+      if (remaining <= 1) {
+        throw new BadRequestException('系统至少需要保留一个平台管理员')
+      }
+    }
+    await this.repository.update(id, { isPlatformAdmin: enabled ? 1 : 0, updateBy: actor.username, updateTime: new Date() })
+    // 降权必须立刻生效：清掉 JwtStrategy 的用户态缓存，否则 30s 内旧值仍被当作平台管理员
+    this.authUserCache.invalidate(id)
+    // TenantMiddleware 自己还有一份租户归属缓存：不清的话，取消平台管理员后最长 30s
+    // 仍会按“平台视角”（tenantId=null）解析，大量租户级查询会直接跳过租户条件读全库
+    this.tenantAccess.invalidate(id)
+    return this.findOneDetail(id)
+  }
+
+  /**
+   * 授予 / 取消 VIP（自助开通租户的资格）
+   *
+   * 与平台管理员同理：单独端点 + platform scope 权限点（system:user:vip），
+   * 不让持有 system:user:update 的租户管理员给本租户的人发 VIP。
+   * 取消 VIP 不清空已开的租户——VIP 只是「能否新开」，租户生命周期看自己的 expire_at。
+   */
+  async setVip(id: string, dto: UpdateUserVipDto, actor: { username?: string }): Promise<UserEntity> {
+    // 先确认用户存在（软删的也拦住），否则会往不存在的账号写 VIP
+    await this.findOne(id)
+    const enabled = dto.vipLevel === 1
+    await this.repository.update(id, {
+      vipLevel: enabled ? 1 : 0,
+      // 取消 VIP 连到期时间一起清掉；授予时空字符串/不传 = 永久
+      vipExpireAt: enabled && dto.vipExpireAt ? new Date(`${dto.vipExpireAt}T23:59:59`) : null,
+      updateBy: actor.username,
+      updateTime: new Date()
+    })
+    this.authUserCache.invalidate(id)
+    return this.findOneDetail(id)
+  }
+
+  /** 管理员强制下线：踢掉该用户全部在线会话（自助改密走 AuthService，带 keepToken，不在这里） */
+  async forceOffline(id: string): Promise<{ kicked: number }> {
+    const user = await this.findOne(id)
+    const kicked = await this.onlineService.kickUser(user.id)
+    return { kicked }
+  }
+
+  /** 管理员解锁：清零登录失败计数（幂等） */
+  async unlock(id: string): Promise<{ unlocked: true }> {
+    const user = await this.findOne(id)
+    await this.rateLimitService.reset(loginFailKeyOf(user.username))
+    return { unlocked: true }
+  }
+
+  /**
+   * 批量启用/停用：逐条复用单条 setStatus 的规则（admin 不可停用、冻结踢会话），
+   * 返回逐条结果供前端提示；单条失败不阻断其他条（与批量删除同语义）
+   */
+  async batchUpdateStatus(
+    ids: string[],
+    status: number,
+    reason?: string
+  ): Promise<{ updated: number; kicked: number; skipped: Array<{ id: string; username: string; reason: string }> }> {
+    const targets = await this.findWritableByIds(normalizeBatchIds(ids))
+    const foundIds = new Set(targets.map(user => user.id))
+    const skipped: Array<{ id: string; username: string; reason: string }> = ids
+      .filter(id => !foundIds.has(id))
+      .map(id => ({ id, username: id, reason: '用户不存在' }))
+    let updated = 0
+    let kicked = 0
+    for (const user of targets) {
+      try {
+        const result = await this.setStatus(user.id, status)
+        updated += 1
+        kicked += result.kicked
+      } catch (error) {
+        skipped.push({ id: user.id, username: user.username, reason: error instanceof Error ? error.message : '操作失败' })
+      }
+    }
+    // reason 仅用于操作日志参数（OperLogInterceptor 记录请求体），这里不落库到 sys_user
+    void reason
+    return { updated, kicked, skipped }
+  }
+
+  /** 批量分配角色：所有用户绑定同一组角色（全量覆盖），任一角色不存在则整体拒绝 */
+  async batchAssignRoles(ids: string[], roleIds: string[]): Promise<{ updated: number }> {
+    const uniqueIds = [...new Set(roleIds.filter(Boolean))]
+    const roles = uniqueIds.length ? await this.roleRepository.findBy({ id: In(uniqueIds) }) : []
+    if (roles.length !== uniqueIds.length) {
+      const found = new Set(roles.map(role => role.id))
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, `角色不存在：${uniqueIds.filter(roleId => !found.has(roleId)).join(',')}`)
+    }
+    // 与 assignRoles 同源的角色租户边界：批量入口之前漏了这层校验，
+    // 租户管理员可以把别家租户的角色批量绑给自己的人（等于跨租户拿权限）
+    const currentTenant = TenantContext.filterTenantId()
+    if (currentTenant !== null) {
+      const illegal = roles.filter(role => {
+        const owner = Number(role.tenantId ?? 0)
+        return owner !== 0 && owner !== currentTenant
+      })
+      if (illegal.length) {
+        throw new BizException(
+          BizErrorCode.TENANT_ROLE_BOUNDARY,
+          `角色「${illegal.map(role => role.roleName ?? role.roleCode).join('、')}」不属于当前租户，不能分配`,
+          HttpStatus.BAD_REQUEST
+        )
+      }
+    }
+    const targets = await this.findWritableByIds(normalizeBatchIds(ids))
+    await this.runInTransaction(async manager => {
+      for (const user of targets) {
+        await this.assignRoles(user.id, roleIds, manager)
+      }
+    })
+    return { updated: targets.length }
+  }
+
+  /** 清除用户权限缓存：用户挂的每个角色各失效一次（缓存按角色分片），改角色/改权限不生效时使用 */
+  async clearPermissionCache(id: string): Promise<{ cleared: number }> {
+    const user = await this.findOne(id)
+    const rows = await this.repository.find({
+      where: { id: user.id, delFlag: 0 },
+      select: { id: true, roles: { id: true } },
+      relations: { roles: true }
+    })
+    const roleIds = (rows[0]?.roles ?? []).map(role => role.id)
+    for (const roleId of roleIds) {
+      await this.permissionCacheService.invalidateRole(roleId)
+    }
+    return { cleared: roleIds.length }
+  }
+
+  /** 设置/清除头像（管理员重置与本人设置共用）：path 来自上传接口的相对路径 */
+  async setAvatar(id: string, avatar?: string | null): Promise<{ avatar: string | null }> {
+    await this.findOne(id)
+    const value = avatar?.trim() || null
+    await this.repository.update(id, { avatar: value, updateTime: new Date() })
+    return { avatar: value }
+  }
+
+  /** 回收站列表：del_flag=1 的软删用户，keyword 前缀搜账号/姓名/电话（同样按租户收窄） */
+  async listRecycled(query: QueryUserDto): Promise<Pagination<UserEntity>> {
+    const qb = this.repository.createQueryBuilder('user').where('user.del_flag = 1').orderBy('user.update_time', 'DESC')
+    this.applyTenantToUsers(qb)
+    if (query.keyword) {
+      qb.andWhere(userKeywordClause('user', query.keyword), { keyword: userKeywordParam(query.keyword) })
+    }
+    return paginate(qb, { page: query.page, pageSize: query.pageSize, count: query.skipCount !== 'true' })
+  }
+
+  /**
+   * 恢复软删用户：
+   * - 软删时 sys_user_role / sys_user_depart / sys_user_watermark 已清空，账号恢复为「空壳」，
+   *   可在本次请求里顺带重绑角色与部门（全量覆盖语义与 assignRoles/assignDepts 一致）
+   * - 用户名若已被在用账号占用则拒绝（避免恢复出两个同名账号）
+   */
+  async restore(id: string, roleIds?: string[], deptIds?: string[]): Promise<UserEntity> {
+    const recycled = await this.repository.findOne({ where: { id, delFlag: 1 } })
+    if (!recycled) {
+      throw new NotFoundException('回收站中没有该用户（可能已被恢复）')
+    }
+    const liveSameName = await this.repository.findOne({ where: { username: recycled.username, delFlag: 0 } })
+    if (liveSameName && liveSameName.id !== id) {
+      throw new BizException(BizErrorCode.BUSINESS_ERROR, `用户名 ${recycled.username} 已被其他在用账号占用，无法恢复`)
+    }
+    await this.runInTransaction(async manager => {
+      await this.repoOf(manager).update(id, { delFlag: 0, status: USER_STATUS.NORMAL, updateTime: new Date() })
+      if (roleIds) {
+        await this.assignRoles(id, roleIds, manager)
+      }
+      if (deptIds) {
+        await this.assignDepts(id, deptIds, manager)
+      }
+      // 软删不清设置行，这里通常是「已有行 → 幂等跳过」；只有改造前就进了回收站的老账号
+      // 才会真的建一行空设置，所以这步不能省
+      await this.userSettingService.ensure(id, manager)
+    })
+    // 恢复后账号状态/归属可能变化，清掉鉴权与租户归属缓存，下一次请求重新解析
+    this.authUserCache.invalidate(id)
+    this.tenantAccess.invalidate(id)
+    // 回收站里的行是裸查出来的（无关联），重查一次补齐角色/部门
+    await this.attachRoles([recycled])
+    await this.attachDepts([recycled])
+    recycled.delFlag = 0
+    recycled.status = USER_STATUS.NORMAL
+    return recycled
+  }
+
+  /**
+   * 校验登录密码
+   * - 新格式（$argon2id$...）：argon2id 比对
+   * - 旧格式（16/32/48 位十六进制）：复算 PBEWithMD5AndDES 比对，
+   *   登录成功后由 upgradePasswordHash 透明升级，无需批量刷库
+   */
+  async verifyPassword(user: UserEntity, plainPassword: string): Promise<boolean> {
+    if (!user.password) {
+      return false
+    }
+    if (isArgon2Hash(user.password)) {
+      return verifyArgon2Password(user.password, plainPassword)
+    }
+    if (!user.salt) {
+      return false
+    }
+    return encryptPassword(user.username, plainPassword, user.salt) === user.password
+  }
+
+  /**
+   * 把旧算法的密码就地升级为 argon2id（登录成功时调用）
+   * 只改 password / salt，不动 update_time —— 用户并没有「修改」账号信息。
+   * 失败不影响本次登录，下次登录会再试一次。
+   */
+  async upgradePasswordHash(id: string, plainPassword: string): Promise<boolean> {
+    try {
+      const hashed = await hashPassword(plainPassword)
+      await this.repository.update(id, { password: hashed, salt: null })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 去掉密码与盐字段，安全返回 */
+  stripPassword(user: UserEntity): Omit<UserEntity, 'password' | 'salt'> {
+    const { password: _password, salt: _salt, ...rest } = user
+    void _password
+    void _salt
+    return rest
+  }
+
+  /**
+   * 导入用户（.xlsx / .csv 解析后的二维数组，第一行为表头）
+   * - 按「登录账号」判定：不存在则新增（密码列留空用默认初始密码），已存在则只更新填了值的字段
+   * - 部门/角色按名称匹配（角色也认编码），多个用 / , 、 ; 分隔；第一个部门即主部门
+   * - 部门/角色写错直接判该行失败，不静默丢弃，避免「导入成功但权限没了」
+   * - 单行失败不影响其他行，逐行统计返回
+   */
+  async importUsers(rows: string[][], headerRowNumber = 1, operator?: string): Promise<UserImportResult> {
+    if (!rows.length) {
+      throw new BizException(BizErrorCode.IMPORT_EMPTY, '文件内容为空，请下载模板后填写', HttpStatus.BAD_REQUEST)
+    }
+    const { columns, dataRows } = this.resolveImportColumns(rows, headerRowNumber)
+    if (columns.username === undefined) {
+      throw new BizException(BizErrorCode.IMPORT_HEADER_MISMATCH, '未找到「登录账号」列，请使用导入模板的表头', HttpStatus.BAD_REQUEST)
+    }
+    if (dataRows.length > USER_IMPORT_MAX_ROWS) {
+      throw new BadRequestException(`单次最多导入 ${USER_IMPORT_MAX_ROWS} 行，当前 ${dataRows.length} 行，请拆分后重试`)
+    }
+    if (!dataRows.length) {
+      throw new BizException(BizErrorCode.IMPORT_EMPTY, '表头下方没有数据行，请填写后再导入', HttpStatus.BAD_REQUEST)
+    }
+
+    const [roles, depts, existingUsers, deletedUsers] = await Promise.all([
+      this.roleRepository.find(),
+      this.deptRepository.find({ where: { delFlag: '0' } }),
+      this.repository.find({ where: { delFlag: 0 } }),
+      this.repository.find({ where: { delFlag: 1 } })
+    ])
+
+    // 角色：名称与编码都能匹配（用户填哪个都行）
+    const roleByKey = new Map<string, RoleEntity>()
+    for (const role of roles) {
+      roleByKey.set(role.roleCode.toLowerCase(), role)
+      if (role.roleName) {
+        roleByKey.set(role.roleName.toLowerCase(), role)
+      }
+    }
+    // 部门：名称与 id 都能匹配
+    const deptByKey = new Map<string, DeptEntity>()
+    for (const dept of depts) {
+      deptByKey.set(dept.id.toLowerCase(), dept)
+      deptByKey.set(dept.departName.toLowerCase(), dept)
+    }
+
+    const userByName = new Map(existingUsers.map(user => [user.username.toLowerCase(), user]))
+    const deletedNames = new Set(deletedUsers.map(user => user.username.toLowerCase()))
+    const seenNames = new Set<string>()
+    const result: UserImportResult = {
+      total: dataRows.length,
+      created: 0,
+      updated: 0,
+      skipped: 0,
+      failed: 0,
+      errors: [],
+      generatedPasswords: []
+    }
+
+    // 手机号/邮箱/工号在库内唯一（唯一索引不区分软删除），先建占用表做预检
+    const owners: Record<UniqueField, Map<string, UniqueOwner>> = { phone: new Map(), email: new Map(), workNo: new Map() }
+    /** 账号 → 当前占用的唯一键值，更新换绑时用来释放旧值，避免同一份文件里互相误判 */
+    const ownedValues: Record<UniqueField, Map<string, string>> = { phone: new Map(), email: new Map(), workNo: new Map() }
+    for (const user of [...existingUsers, ...deletedUsers]) {
+      const owner: UniqueOwner = { username: user.username, deleted: user.delFlag === 1 }
+      const nameKey = user.username.toLowerCase()
+      for (const field of ['phone', 'email', 'workNo'] as UniqueField[]) {
+        const key = uniqueKey(user[field])
+        if (!key) {
+          continue
+        }
+        owners[field].set(key, owner)
+        ownedValues[field].set(nameKey, key)
+      }
+    }
+
+    /** 该值是否被「别人」占用（自己覆盖自己不算冲突） */
+    const findConflict = (field: UniqueField, label: string, raw: string, selfName: string): string | null => {
+      const key = uniqueKey(raw)
+      if (!key) {
+        return null
+      }
+      const owner = owners[field].get(key)
+      if (!owner || owner.username.toLowerCase() === selfName) {
+        return null
+      }
+      return `${label}「${raw.trim()}」已被账号「${owner.username}」占用${owner.deleted ? '（该账号已删除，但唯一索引仍占用，请先恢复原账号或换一个）' : ''}`
+    }
+
+    /** 写入成功后同步占用表：先释放本账号旧值，再登记新值 */
+    const syncOwner = (field: UniqueField, raw: string, selfName: string, username: string): void => {
+      const previous = ownedValues[field].get(selfName)
+      if (previous && owners[field].get(previous)?.username.toLowerCase() === selfName) {
+        owners[field].delete(previous)
+        ownedValues[field].delete(selfName)
+      }
+      const key = uniqueKey(raw)
+      if (key) {
+        owners[field].set(key, { username, deleted: false })
+        ownedValues[field].set(selfName, key)
+      }
+    }
+
+    /** 读取某列文本（列不存在时返回空串） */
+    const pick = (cells: string[], field: UserImportField): string => {
+      const index = columns[field]
+      return index === undefined ? '' : (cells[index] ?? '').trim()
+    }
+
+    for (const { rowNumber, cells } of dataRows) {
+      const username = pick(cells, 'username')
+      const fail = (message: string) => {
+        result.failed += 1
+        result.errors.push({ row: rowNumber, username, message })
+      }
+
+      if (!username) {
+        fail('登录账号不能为空')
+        continue
+      }
+      if (!USERNAME_PATTERN.test(username)) {
+        fail('登录账号需 3~100 位、以字母开头，只能包含字母/数字/下划线/点/横线/@')
+        continue
+      }
+      const nameKey = username.toLowerCase()
+      if (seenNames.has(nameKey)) {
+        result.skipped += 1
+        result.errors.push({ row: rowNumber, username, message: '文件内登录账号重复，本行已跳过' })
+        continue
+      }
+      seenNames.add(nameKey)
+
+      const realname = pick(cells, 'realname')
+      if (!realname) {
+        fail('真实姓名不能为空')
+        continue
+      }
+      const password = pick(cells, 'password')
+      if (password && (password.length < 6 || password.length > 64)) {
+        fail('密码长度须在 6~64 位之间（留空表示新建时用初始密码、更新时保留原密码）')
+        continue
+      }
+
+      const sexText = pick(cells, 'sex')
+      const sex = sexText ? SEX_LABELS[sexText.toLowerCase()] : undefined
+      if (sexText && sex === undefined) {
+        fail('性别请填「男」或「女」')
+        continue
+      }
+      const statusText = pick(cells, 'status')
+      const status = statusText ? STATUS_LABELS[statusText.toLowerCase()] : undefined
+      if (statusText && status === undefined) {
+        fail('状态请填「正常」或「冻结」')
+        continue
+      }
+      const birthdayText = pick(cells, 'birthday')
+      const birthday = birthdayText ? normalizeDateText(birthdayText) : undefined
+      if (birthdayText && !birthday) {
+        fail(`生日「${birthdayText}」格式不正确，请用 1990-01-01 这种格式`)
+        continue
+      }
+
+      // 部门：名称或 id，顺序即主次
+      const deptNames = splitMultiValue(pick(cells, 'deptNames'))
+      const deptIds: string[] | undefined = deptNames.length ? [] : undefined
+      const missingDepts: string[] = []
+      for (const name of deptNames) {
+        const dept = deptByKey.get(name.toLowerCase())
+        if (dept) {
+          deptIds?.push(dept.id)
+        } else {
+          missingDepts.push(name)
+        }
+      }
+      if (missingDepts.length) {
+        fail(`部门不存在：${missingDepts.join('、')}（请填部门名称，或先到部门管理里创建）`)
+        continue
+      }
+
+      // 角色：名称或编码
+      const roleNames = splitMultiValue(pick(cells, 'roleNames'))
+      const roleIds: string[] | undefined = roleNames.length ? [] : undefined
+      const missingRoles: string[] = []
+      for (const name of roleNames) {
+        const role = roleByKey.get(name.toLowerCase())
+        if (role) {
+          roleIds?.push(role.id)
+        } else {
+          missingRoles.push(name)
+        }
+      }
+      if (missingRoles.length) {
+        fail(`角色不存在：${missingRoles.join('、')}（可填角色名称或角色编码）`)
+        continue
+      }
+
+      const phone = pick(cells, 'phone')
+      const email = pick(cells, 'email')
+      const workNo = pick(cells, 'workNo')
+      // 唯一键预检：跟「别的账号」冲突才拦，自己覆盖自己的值放行
+      const uniqueConflict =
+        findConflict('phone', '手机号', phone, nameKey) ?? findConflict('email', '邮箱', email, nameKey) ?? findConflict('workNo', '工号', workNo, nameKey)
+      if (uniqueConflict) {
+        fail(uniqueConflict)
+        continue
+      }
+
+      const current = userByName.get(nameKey)
+      try {
+        if (current) {
+          // 更新：只写填了值的字段，空单元格视为「不修改」
+          await this.update(
+            current.id,
+            {
+              realname,
+              sex,
+              birthday: birthday ?? undefined,
+              status,
+              password: password || undefined,
+              // 导入更新时重置了密码 → 与「重置密码」语义一致：用户下次登录必须改密
+              mustChangePassword: password ? 1 : undefined,
+              phone: phone || undefined,
+              email: email || undefined,
+              workNo: workNo || undefined,
+              roleIds,
+              deptIds
+            },
+            operator
+          )
+          syncOwner('phone', phone, nameKey, current.username)
+          syncOwner('email', email, nameKey, current.username)
+          syncOwner('workNo', workNo, nameKey, current.username)
+          result.updated += 1
+        } else {
+          if (deletedNames.has(nameKey)) {
+            fail('该账号已被删除（软删除记录仍占用账号），请改用其他账号或先恢复原账号')
+            continue
+          }
+          // 密码列留空 → 每行生成独立随机初始密码（绝不共享固定值），并标记强制首次登录改密；
+          // 明文密码只在本次导入结果里出现一次，由管理员线下分发给用户
+          const initialPassword = password || randomToken(12)
+          const created = await this.create(
+            {
+              username,
+              realname,
+              password: initialPassword,
+              mustChangePassword: password ? undefined : 1,
+              sex,
+              birthday: birthday ?? undefined,
+              status: status ?? USER_STATUS.NORMAL,
+              phone: phone || undefined,
+              email: email || undefined,
+              workNo: workNo || undefined,
+              roleIds,
+              deptIds
+            },
+            operator
+          )
+          if (!password) {
+            result.generatedPasswords.push({ row: rowNumber, username, password: initialPassword })
+          }
+          userByName.set(nameKey, created)
+          syncOwner('phone', phone, nameKey, username)
+          syncOwner('email', email, nameKey, username)
+          syncOwner('workNo', workNo, nameKey, username)
+          result.created += 1
+        }
+      } catch (error) {
+        fail(describeWriteError(error))
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * 解析导入列位置：按表头别名定位（忽略大小写与手写星号），第一行即表头
+   * 行号取 Excel 真实行号，报错时用户能直接定位到文件里的第几行
+   */
+  private resolveImportColumns(
+    rows: string[][],
+    headerRowNumber: number
+  ): { columns: Partial<Record<UserImportField, number>>; dataRows: Array<{ rowNumber: number; cells: string[] }> } {
+    const header = rows[0].map(cell => cell.replace(/[\s*＊]/g, '').toLowerCase())
+    const columns: Partial<Record<UserImportField, number>> = {}
+    for (const field of Object.keys(USER_IMPORT_ALIASES) as UserImportField[]) {
+      const index = header.findIndex(cell => USER_IMPORT_ALIASES[field].includes(cell))
+      if (index >= 0) {
+        columns[field] = index
+      }
+    }
+    const dataRows = rows.slice(1).map((cells, index) => ({ rowNumber: headerRowNumber + index + 1, cells }))
+    return { columns, dataRows }
+  }
+
+  /**
+   * 去掉不允许客户端直接写入的字段
+   * - depts / dept：关系字段与组装字段，非数据库列
+   * - depart_ids / org_code：由 assignDepts 按主部门统一维护，避免两处写法互相覆盖
+   */
+  private stripUnwritableFields(data: Partial<UserEntity>): void {
+    delete data.depts
+    delete data.dept
+    delete data.deptId
+    delete data.departIds
+    delete data.orgCode
+    delete data.posts
+    delete data.level
+    // 平台管理员标记只能走 setPlatformAdmin：混进通用更新接口等于把「租户→平台」的提权口子开给所有能改用户的人
+    delete data.isPlatformAdmin
+  }
+
+  /**
+   * 归一化职级 ID：空串/空白统一为 null（前端「未选择」会传 ''），非空必须真实存在，
+   * 否则写进去一条孤儿引用，列表上永远显示不出职级名称还没法排查
+   */
+  private async resolveLevelId(levelId?: string | null): Promise<string | null> {
+    const trimmed = levelId?.trim()
+    if (!trimmed) {
+      return null
+    }
+    const exists = await this.levelRepository.findOne({ where: { id: trimmed }, select: { id: true } })
+    if (!exists) {
+      throw new BadRequestException(`职级不存在：${trimmed}`)
+    }
+    return trimmed
+  }
+
+  /** 按 depart_ids 顺序整理部门，并把 depts[0] 同步到兼容字段 dept / deptId */
+  private applyDepts(user: UserEntity): void {
+    user.depts = this.orderDepts(user.depts ?? [], user.departIds)
+    user.dept = user.depts[0] ?? null
+    user.deptId = user.dept?.id ?? null
+  }
+
+  /** 批量补部门（列表页一次查关联表，避免 N+1） */
+  private async attachDepts(users: UserEntity[]): Promise<void> {
+    if (!users.length) {
+      return
+    }
+    const rows = await this.repository.find({
+      where: { id: In(users.map(user => user.id)) },
+      relations: { depts: true }
+    })
+    const deptMap = new Map(rows.map(row => [row.id, this.orderDepts(row.depts ?? [], row.departIds)]))
+    for (const user of users) {
+      user.depts = deptMap.get(user.id) ?? []
+      user.dept = user.depts[0] ?? null
+      user.deptId = user.dept?.id ?? null
+    }
+  }
+
+  /** 批量补角色（列表/导出共用，只取 id/roleName/roleCode，避免带出菜单等大对象） */
+  private async attachRoles(users: UserEntity[]): Promise<void> {
+    if (!users.length) {
+      return
+    }
+    const rows = await this.repository.find({
+      where: { id: In(users.map(user => user.id)), delFlag: 0 },
+      select: { id: true, roles: { id: true, roleName: true, roleCode: true } },
+      relations: { roles: true }
+    })
+    const rolesByUser = new Map(rows.map(row => [row.id, row.roles ?? []]))
+    for (const user of users) {
+      user.roles = rolesByUser.get(user.id) ?? []
+    }
+  }
+
+  /** 批量补岗位（列表/导出/详情共用，只取 id/postName/postCode） */
+  private async attachPosts(users: UserEntity[]): Promise<void> {
+    if (!users.length) {
+      return
+    }
+    const rows = await this.repository.find({
+      where: { id: In(users.map(user => user.id)) },
+      select: { id: true, posts: { id: true, postName: true, postCode: true } },
+      relations: { posts: true }
+    })
+    const postsByUser = new Map(rows.map(row => [row.id, row.posts ?? []]))
+    for (const user of users) {
+      user.posts = postsByUser.get(user.id) ?? []
+    }
+  }
+
+  /** 批量补职级（列表/导出/详情共用，只取 id/levelName；levelId 为空的用户跳过查询） */
+  private async attachLevel(users: UserEntity[]): Promise<void> {
+    const levelIds = [...new Set(users.map(user => user.levelId).filter((id): id is string => !!id))]
+    if (!levelIds.length) {
+      return
+    }
+    const levels = await this.levelRepository.find({ where: { id: In(levelIds) }, select: { id: true, levelName: true } })
+    const levelMap = new Map(levels.map(level => [level.id, level]))
+    for (const user of users) {
+      user.level = user.levelId ? (levelMap.get(user.levelId) ?? null) : null
+    }
+  }
+
+  /**
+   * 批量补水印状态（列表/导出/详情共用）
+   *
+   * 一次查全局配置 + 一次查用户覆盖，再走 resolveWatermarkState 统一算生效结果；
+   * 刻意不在循环里逐条 findOne —— 200 个用户就是 200 次 SQL。
+   */
+  private async attachWatermark(users: UserEntity[]): Promise<void> {
+    if (!users.length) {
+      return
+    }
+    // 策略已按租户拆分：本租户配置优先，没有则继承平台默认（tenant_id=0），都没有用兜底常量
+    const scopeTenantId = TenantContext.filterTenantId()
+    const [ownRow, platformRow, rows] = await Promise.all([
+      scopeTenantId !== null && scopeTenantId > 0 ? this.watermarkSettingRepository.findOne({ where: { tenantId: scopeTenantId } }) : Promise.resolve(null),
+      this.watermarkSettingRepository.findOne({ where: { tenantId: 0 } }),
+      this.userWatermarkRepository.find({ where: { userId: In(users.map(user => user.id)) } })
+    ])
+    const settingRow = ownRow ?? platformRow
+    const setting = settingRow
+      ? {
+          enabled: Number(settingRow.enabled),
+          mode: settingRow.mode,
+          content: settingRow.content,
+          density: settingRow.density,
+          opacity: Number(settingRow.opacity),
+          rotate: Number(settingRow.rotate),
+          fontSize: Number(settingRow.fontSize)
+        }
+      : FALLBACK_WATERMARK_SETTING
+    const customByUser = new Map(rows.map(row => [row.userId, row]))
+    for (const user of users) {
+      const custom = customByUser.get(user.id)
+      user.watermarkEnabled = custom?.enabled ?? null
+      user.watermarkEnforced = custom?.enforced ?? 0
+      user.watermarkEffective = resolveWatermarkState(setting, custom).enabled
+    }
+  }
+
+  /** 按 depart_ids 的先后排序（未登记的排最后） */
+  private orderDepts(depts: DeptEntity[], departIds?: string | null): DeptEntity[] {
+    if (!departIds) {
+      return depts
+    }
+    const rank = new Map(
+      departIds
+        .split(',')
+        .filter(Boolean)
+        .map((depId, index) => [depId, index])
+    )
+    const last = Number.MAX_SAFE_INTEGER
+    return [...depts].sort((a, b) => (rank.get(a.id) ?? last) - (rank.get(b.id) ?? last))
+  }
+}

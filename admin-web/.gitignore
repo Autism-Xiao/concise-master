@@ -1,0 +1,34 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# TanStack Router cache
+.tanstack
+
+# 用户界面设置（个人偏好不入库）
+settings.json
+
+# WorkBuddy 工作区数据与本地文档（不入库）
+/.workbuddy/
+/docs/

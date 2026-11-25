@@ -1,0 +1,58 @@
+import type { BatchDeleteResult } from '@/lib/batch-delete'
+import { getApiResult } from '@/lib/http'
+
+/** 一条在线会话（来自后端 Redis 会话，非表数据） */
+export interface OnlineUser {
+  /** 会话编号 = accessToken 哈希，用于强制下线 */
+  sessionId: string
+  userId: string
+  username: string
+  dept: string
+  ip: string
+  location: string
+  browser: string
+  os: string
+  loginTime: string
+  lastActive: string
+  /** 令牌过期时间（到点会话自动消失） */
+  expiresAt: string
+}
+
+export interface OnlinePage {
+  records: OnlineUser[]
+  total: number
+  current: number
+  size: number
+  pages: number
+}
+
+const BASE = '/backend-api/v1/online'
+
+/** 在线用户列表（服务端分页 + 关键字；会话存在 Redis 里，后端一次 scan 后内存分页） */
+export function fetchOnlineUsers(params: { page?: number; pageSize?: number; keyword?: string } = {}): Promise<OnlinePage> {
+  const search = new URLSearchParams({ page: String(params.page ?? 1), pageSize: String(params.pageSize ?? 20) })
+  if (params.keyword?.trim()) search.set('keyword', params.keyword.trim())
+  return getApiResult<OnlinePage>(`${BASE}?${search.toString()}`)
+}
+
+/** 强制下线（该令牌立即失效，用户后续请求 401） */
+export function kickUser(sessionId: string): Promise<{ kicked: number }> {
+  return getApiResult<{ kicked: number }>(`${BASE}/${sessionId}`, { method: 'DELETE' })
+}
+
+export function formatDateTime(value?: string | null): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** 批量强制下线：sessionId 走统一批量接口的 ids 字段，逐条结算 */
+export function batchKickUsers(sessionIds: string[]): Promise<BatchDeleteResult> {
+  return getApiResult<{ kicked: number; failed: Array<{ id: string; reason: string }> }>(`${BASE}/batch-kick`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids: sessionIds })
+  }).then(result => ({ deleted: result.kicked, failed: result.failed }))
+}

@@ -1,0 +1,98 @@
+import { BadRequestException, Injectable } from '@nestjs/common'
+import { InjectDataSource } from '@nestjs/typeorm'
+import { DataSource } from 'typeorm'
+
+import { SystemConfigService } from '../../modules/system/config/system-config.service'
+import { TenantContext } from '../tenant/tenant.context'
+import { queryRaw } from '../../shared/database/raw-query'
+
+/** 配额配置键（与 sys_config 平台行、SystemConfigService.DEFAULTS 保持一致） */
+export const QUOTA_KEYS = {
+  maxUsers: 'tenant.quota.maxUsers',
+  maxStorageMb: 'tenant.quota.maxStorageMb',
+  apiCalls: 'tenant.quota.apiCalls'
+} as const
+
+/**
+ * 租户资源配额服务
+ *
+ * 两个口径：
+ * - 用户数：sys_user_tenant.status=0 且 sys_user.del_flag=0（与「删除租户前校验」一致；
+ *   login_tenant_id 只是上次登录选择，不能当归属用）。
+ * - 存储：sys_file 中「本租户 + 未进回收站 + 非文件夹」的 size 之和。
+ *   严格只看本租户，不含 tenant_id=0 的共享行；与个人配额（applyTenantScope 含共享）口径不同，
+ *   因为租户配额算的是这个租户自己占用的资源。
+ *
+ * 0 / 负数 = 不限制。平台视角（tenantId<=0）不做配额判断，避免把平台共享数据误算进某个租户。
+ * 计数用参数化原生 SQL 做聚合，不涉及任何写路径，也不拼接用户输入。
+ */
+@Injectable()
+export class QuotaService {
+  constructor(
+    @InjectDataSource() private readonly dataSource: DataSource,
+    private readonly config: SystemConfigService
+  ) {}
+
+  /** 按「目标租户」读配置：平台代管时必须读该租户的覆盖行，而不是平台行的值 */
+  private limitFor(tenantId: number, key: string): Promise<number> {
+    return TenantContext.withTenant(tenantId, () => this.config.getNumber(key, 0))
+  }
+
+  /** 建号前调用：extra = 本次要新增的成员数（批量加入时传实际新增数） */
+  async assertUserQuota(tenantId: number, extra = 1): Promise<void> {
+    if (!(tenantId > 0) || extra <= 0) return
+    const limit = await this.limitFor(tenantId, QUOTA_KEYS.maxUsers)
+    if (!(limit > 0)) return
+
+    const rows = await queryRaw<Array<{ c: number | string }>>(
+      this.dataSource,
+      `SELECT COUNT(*) AS c
+         FROM sys_user_tenant ut
+         INNER JOIN sys_user u ON u.id = ut.user_id AND u.del_flag = 0
+        WHERE ut.tenant_id = ? AND ut.status = 0`,
+      [tenantId]
+    )
+    const used = Number(rows[0]?.c ?? 0)
+    if (used + extra > limit) {
+      throw new BadRequestException(`租户用户数已达上限：当前 ${used} 人，上限 ${limit} 人，本次新增 ${extra} 人`)
+    }
+  }
+
+  /** 上传前调用：extraBytes = 本次新增字节数（覆盖上传传差值） */
+  async assertStorageQuota(tenantId: number, extraBytes: number): Promise<void> {
+    if (!(tenantId > 0) || !(extraBytes > 0)) return
+    const limitMb = await this.limitFor(tenantId, QUOTA_KEYS.maxStorageMb)
+    if (!(limitMb > 0)) return
+    const limitBytes = limitMb * 1024 * 1024
+
+    const rows = await queryRaw<Array<{ c: number | string }>>(
+      this.dataSource,
+      'SELECT COALESCE(SUM(f.size), 0) AS c FROM sys_file f WHERE f.tenant_id = ? AND f.is_deleted = 0 AND f.is_folder = 0',
+      [tenantId]
+    )
+    const used = Number(rows[0]?.c ?? 0)
+    if (used + extraBytes > limitBytes) {
+      throw new BadRequestException(`租户存储空间不足：当前 ${(used / 1024 / 1024).toFixed(2)} MB，上限 ${limitMb} MB`)
+    }
+  }
+
+  /** 租户月度 API 调用量上限（0 = 不限制）；QuotaGuard 每请求调用，走 sys_config 租户覆盖行 */
+  apiCallsLimit(tenantId: number): Promise<number> {
+    return this.limitFor(tenantId, QUOTA_KEYS.apiCalls)
+  }
+
+  /**
+   * 租户当月已落库的 API 调用量（sys_tenant_usage，metering 攒批有 ≤30s 延迟）。
+   * 不在这里主动 flush：QuotaGuard 每请求都走这条路径，flush 的批量 upsert 开销
+   * 会把计量延迟问题转嫁成请求延迟；拦截精度由守卫侧的增量计数器补齐。
+   */
+  async apiCallsUsed(tenantId: number, period: string): Promise<number> {
+    if (!(tenantId > 0)) return 0
+    const rows = await queryRaw<Array<{ c: number | string }>>(
+      this.dataSource,
+      'SELECT COALESCE(value, 0) AS c FROM sys_tenant_usage WHERE tenant_id = ? AND metric = ? AND period = ? LIMIT 1',
+      [tenantId, 'api.calls', period]
+    )
+    return Number(rows[0]?.c ?? 0)
+  }
+}

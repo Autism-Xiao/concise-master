@@ -1,0 +1,162 @@
+import react from '@vitejs/plugin-react'
+import fs from 'fs'
+import path from 'path'
+import { defineConfig, type Plugin } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
+import { tanstackRouter } from '@tanstack/router-plugin/vite'
+
+// 仍是本地数据文件的模块（文件管理、行政区划、租户均已接真实后端，对应 mock 已删除）
+const REGIONS_FILE = path.resolve(__dirname, 'public/mock/regions.json')
+// 后端地址：开发环境通过 /backend-api 代理访问，规避 CORS（生产环境由网关/Nginx 转发）
+// 端口默认跟随同仓后端的 .env（../server/.env 的 PORT），读不到才退回 3000，
+// 避免「后端改了端口、前端还指着旧端口」导致页面全是 502、且终端一声不吭的情况。
+// 真机调试可用 BACKEND_URL=http://<局域网IP>:<端口> 覆盖，或用 BACKEND_PORT 只改端口。
+// 注意：这里写错不会报错，只会让代理返回 502（前端表现为「拿不到 JSON」），排查时先看后端端口。
+function resolveBackendPort(): string {
+  if (process.env.BACKEND_PORT) return process.env.BACKEND_PORT
+  try {
+    const envFile = path.resolve(__dirname, '../server/.env')
+    const port = /^\s*PORT\s*=\s*(\d+)/m.exec(fs.readFileSync(envFile, 'utf8'))?.[1]
+    if (port) return port
+  } catch {
+    // 后端仓库不在一起（单独 clone 前端）时走下面的默认值
+  }
+  return '3000'
+}
+const BACKEND_PORT = resolveBackendPort()
+const BACKEND_URL = process.env.BACKEND_URL ?? `http://127.0.0.1:${BACKEND_PORT}`
+const FRONTEND_PORT = 5173
+
+/**
+ * dev server 监听地址。
+ *
+ * vite 默认只绑 `localhost`，在 Windows 上会解析成 IPv6 的 `::1` 并**只**监听该地址，
+ * 结果是「localhost:5173 打得开、127.0.0.1:5173 打不开」，浏览器直接报无法访问该网站，
+ * 看起来就像项目没起来（终端里 vite 已经打印 ready，两边信息对不上，极难自查）。
+ * 绑 `::` 让 Node 走双栈套接字（ipv6Only=false），IPv4 / IPv6 都能连。
+ * 需要只对某个网卡开放时用 FRONTEND_HOST=127.0.0.1 覆盖。
+ */
+const FRONTEND_HOST = process.env.FRONTEND_HOST ?? '::'
+
+/**
+ * 代理失败时在**终端**直接说清楚原因
+ *
+ * 默认行为是：浏览器收到 502，终端一声不吭。用户只看到页面报错，
+ * 完全不知道该去看后端。这里把「连不上谁、该做什么」打印在跑 dev 的那个窗口里。
+ * 节流 30 秒，避免页面并发请求把终端刷满。
+ */
+function proxyErrorLogger() {
+  let lastAt = 0
+  return (err: Error) => {
+    const now = Date.now()
+    if (now - lastAt < 30000) return
+    lastAt = now
+    console.error(`\n  ✖ 代理转发失败：${BACKEND_URL} 连不上（${err.message}）`)
+    console.error(`    请先启动后端：cd ../server; npm run restart`)
+    console.error(`    若后端端口不是 ${BACKEND_PORT}，用 BACKEND_PORT=<端口> 重新启动前端\n`)
+  }
+}
+
+/** 启动后在终端醒目打印「该访问哪个地址」，端口被占自动换端口时尤其重要 */
+function startupInfo(): Plugin {
+  return {
+    name: 'concise-startup-info',
+    configureServer(server) {
+      const print = () => {
+        const address = server.httpServer?.address()
+        const port = typeof address === 'object' && address ? address.port : FRONTEND_PORT
+        console.log(`\n  后端代理 → ${BACKEND_URL}`)
+        // 两个地址都打出来：监听地址是 `::` 时 IPv4 / IPv6 都在，用户点哪个都能开
+        console.log(`  请访问   → http://localhost:${port}`)
+        if (FRONTEND_HOST === '::') console.log(`           → http://127.0.0.1:${port}`)
+        // 只有「配置的端口与实际监听端口不一致」才是被占用后自动换的；
+        // 用户自己用 --port 指定别的端口时不要误导成「被占用」
+        const configuredPort = server.config.server.port ?? FRONTEND_PORT
+        if (port !== configuredPort) {
+          console.log(`  ⚠ 端口 ${configuredPort} 已被其它程序占用，vite 自动改用了 ${port}。`)
+          console.log(`    打开 ${configuredPort} 会看到别的项目，请用上面这个地址。`)
+        }
+        console.log('')
+      }
+      // 视 vite 版本，configureServer 执行时可能已经 listening
+      if (server.httpServer?.listening) print()
+      else server.httpServer?.once('listening', print)
+    }
+  }
+}
+
+// 管理页保存时写回 public/mock/*.json（仅开发环境；
+// 生产环境把前端的 saveXxx 换成真实接口即可）
+function jsonWriteApi(name: string, route: string, file: string): Plugin {
+  return {
+    name,
+    configureServer(server) {
+      server.middlewares.use(route, (req, res) => {
+        if (req.method === 'POST') {
+          let body = ''
+          req.on('data', chunk => (body += chunk))
+          req.on('end', () => {
+            try {
+              const data = JSON.parse(body)
+              if (!Array.isArray(data)) throw new Error('expect array')
+              // 原子写：先写临时文件再重命名
+              const tmp = file + '.tmp'
+              fs.writeFileSync(tmp, JSON.stringify(data, null, 2))
+              fs.renameSync(tmp, file)
+              res.setHeader('Content-Type', 'application/json')
+              res.end(JSON.stringify({ ok: true, count: data.length }))
+            } catch {
+              res.statusCode = 400
+              res.end(JSON.stringify({ error: 'invalid json' }))
+            }
+          })
+          return
+        }
+        res.statusCode = 405
+        res.end()
+      })
+    }
+  }
+}
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [
+    tanstackRouter({
+      target: 'react',
+      autoCodeSplitting: true
+    }),
+    react(),
+    tailwindcss(),
+    jsonWriteApi('concise-regions-api', '/api/regions', REGIONS_FILE),
+    startupInfo()
+  ],
+  server: {
+    host: FRONTEND_HOST,
+    port: FRONTEND_PORT,
+    proxy: {
+      '/backend-api': {
+        target: BACKEND_URL,
+        changeOrigin: true,
+        rewrite: p => p.replace(/^\/backend-api/, '/api'),
+        configure: proxy => {
+          proxy.on('error', proxyErrorLogger())
+        }
+      },
+      // 上传文件的静态地址（后端 public/upload 以 {host}/upload/... 访问），开发环境同样代理过去
+      '/upload': {
+        target: BACKEND_URL,
+        changeOrigin: true
+      }
+    },
+    watch: {
+      // mock 写回文件由接口写入，变化不应触发页面刷新
+      ignored: ['**/public/mock/regions.json']
+    }
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src')
+    }
+  }
+})

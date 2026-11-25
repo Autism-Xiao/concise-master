@@ -1,0 +1,544 @@
+import { BadRequestException, HttpStatus, Injectable, NotFoundException } from '@nestjs/common'
+import { InjectRepository } from '@nestjs/typeorm'
+import { In, Not, Repository, type EntityManager } from 'typeorm'
+
+import { BaseService } from '../../helper/crud/base.service'
+import { applySort, paginate, Pagination } from '../../helper/paginate'
+import { BizErrorCode } from '../../common/enums/biz-error-code.enum'
+import { BizException } from '../../common/exceptions/biz.exception'
+import { applyTenantScope, tenantWriteCondition } from '../../shared/tenant/tenant-scope.util'
+import { TenantContext } from '../../shared/tenant/tenant.context'
+import { PermissionCacheService } from '../../shared/permission-cache/permission-cache.service'
+import { AuthUserCacheService } from '../../shared/auth-cache/auth-user-cache.service'
+import { normalizeBatchIds, runBatchDelete, type BatchDeleteResult } from '../../helper/crud/batch-delete'
+import { isSuperRole } from '../../utils/super-role.util'
+import { randomId32 } from '../../utils/password.util'
+import { RoleEntity } from './entities/role.entity'
+import { MenuEntity } from '../menu/entities/menu.entity'
+import { TenantEntity } from '../system/tenant/entities/tenant.entity'
+import type { CreateRoleDto } from './dto/create-role.dto'
+import type { QueryRoleDto } from './dto/query-role.dto'
+import type { UpdateRoleDto } from './dto/update-role.dto'
+import { queryRaw } from '../../shared/database/raw-query'
+
+/** 导入结果：逐行统计 + 失败明细（前端据此展示导入报告） */
+export interface RoleImportResult {
+  /** 参与解析的数据行数（不含表头、空行） */
+  total: number
+  created: number
+  updated: number
+  /** 跳过行数（编码重复于本文件内） */
+  skipped: number
+  failed: number
+  errors: Array<{ row: number; roleCode: string; message: string }>
+}
+
+/** 导入单文件上限：2000 行、5MB，防止一次性灌爆内存 */
+export const ROLE_IMPORT_MAX_ROWS = 2000
+export const ROLE_IMPORT_MAX_SIZE = 5 * 1024 * 1024
+
+/** 角色编码规则：字母开头，允许字母/数字/下划线/冒号/点/短横线，最长 100 */
+const ROLE_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_:.-]*$/
+
+/** 可排序字段白名单：前端列 id → 实体属性名（未列出的列点了表头也只走默认排序） */
+const ROLE_SORTABLE: Record<string, string> = {
+  roleName: 'roleName',
+  roleCode: 'roleCode',
+  status: 'status',
+  createTime: 'createTime'
+}
+
+@Injectable()
+export class RoleService extends BaseService<RoleEntity> {
+  constructor(
+    @InjectRepository(RoleEntity)
+    private readonly roleRepository: Repository<RoleEntity>,
+    @InjectRepository(TenantEntity)
+    private readonly tenantRepository: Repository<TenantEntity>,
+    private readonly permissionCache: PermissionCacheService,
+    private readonly authUserCache: AuthUserCacheService
+  ) {
+    super(roleRepository, '角色')
+  }
+
+  /**
+   * 角色列表（含已授权菜单），服务端分页 + 关键字 + 排序
+   *
+   * 附带 tenantName：平台视角下会同时看到多个租户各自的角色模板（每个租户一套
+   * admin/editor/viewer，同名同码是设计如此），不标归属会被当成「重复数据」。
+   * tenant_id=0 是平台共享角色，没有租户名可标。
+   */
+  async listByQuery(query: QueryRoleDto): Promise<Pagination<RoleEntity & { tenantName?: string }>> {
+    const rolesQb = this.buildRoleQuery(query, false)
+    // 白名单外的 sortBy 静默忽略，保留默认排序
+    applySort(rolesQb, 'role', query, ROLE_SORTABLE)
+    const page = await paginate(rolesQb, { page: query.page, pageSize: query.pageSize })
+    const withMeta = await this.withTenantName(page)
+    // 权限不在分页 JOIN 里加载（一对多会放大中间行、拖慢 COUNT），改为按本页 id 批量回填
+    withMeta.records = await this.attachPermissions(withMeta.records)
+    return withMeta
+  }
+
+  /** 列表查询的公共条件（租户范围 + 关键字 + 默认排序），导出复用同一套，避免两边筛选语义漂移 */
+  private buildRoleQuery(query: QueryRoleDto, withPermissions = true) {
+    // 默认按归属租户分组排序：平台共享（0）在前，各租户的行聚在一起 → 前端分组表头不会交替出现
+    const qb = this.roleRepository.createQueryBuilder('role')
+    // 列表/导出分页时不在主查询 JOIN 权限：一对多会产生 role×perm 笛卡尔行，
+    // COUNT(DISTINCT) 与中间行去重在大租户下开销陡增；改由 attachPermissions 批量回填。
+    if (withPermissions) qb.leftJoinAndSelect('role.permissions', 'perm')
+    qb.orderBy('role.tenantId', 'ASC').addOrderBy('role.createTime', 'ASC')
+    applyTenantScope(qb, 'role')
+    const keyword = query.keyword?.trim()
+    if (keyword) {
+      qb.andWhere('(role.roleName LIKE :kw OR role.roleCode LIKE :kw)', { kw: `%${keyword}%` })
+    }
+    // 平台视角的「归属」筛选：0 = 平台共享，>0 = 指定租户
+    if (query.tenantId !== undefined && query.tenantId !== null) {
+      qb.andWhere('role.tenantId = :tenantId', { tenantId: query.tenantId })
+    }
+    return qb
+  }
+
+  /** 给角色补所属租户名（平台视角下区分各租户的同名模板），分页与导出共用 */
+  private async withTenantName(page: Pagination<RoleEntity & { tenantName?: string }>): Promise<Pagination<RoleEntity & { tenantName?: string }>> {
+    const records = await this.attachTenantNames(page.records)
+    return new Pagination(records, page.total, page.current, page.size, page.hasNext)
+  }
+
+  private async attachTenantNames(records: RoleEntity[]): Promise<Array<RoleEntity & { tenantName?: string }>> {
+    const tenantIds = [...new Set(records.map(role => Number(role.tenantId ?? 0)).filter(id => id > 0))]
+    if (!tenantIds.length) {
+      return records
+    }
+    const tenants = await this.tenantRepository.find({ where: { id: In(tenantIds) }, select: { id: true, name: true } })
+    const nameById = new Map(tenants.map(tenant => [tenant.id, tenant.name]))
+    return records.map(role => {
+      const tid = Number(role.tenantId ?? 0)
+      // oxlint-disable-next-line typescript/no-misused-spread -- 实体实例挂计算字段，响应走 JSON 序列化
+      return tid > 0 ? { ...role, tenantName: nameById.get(tid) } : role
+    })
+  }
+
+  /**
+   * 按本页角色 id 批量回填 permissions（替代分页 JOIN 的一对多放大）。
+   * 一次 JOIN 查询把本页所有角色的权限捞回，再按 role_id 归类，整体 2 次 SQL，
+   * 与角色数/每角色权限数无关（分页 JOIN 则是 role×perm 行全部进内存去重）。
+   */
+  private async attachPermissions(roles: Array<RoleEntity & { tenantName?: string }>): Promise<Array<RoleEntity & { tenantName?: string }>> {
+    const ids = roles.map(role => role.id).filter(Boolean)
+    if (!ids.length) return roles
+    const rows = await this.roleRepository
+      .createQueryBuilder('role')
+      .leftJoinAndSelect('role.permissions', 'perm')
+      .where('role.id IN (:...ids)', { ids })
+      .getMany()
+    const byId = new Map(rows.map(row => [row.id, row.permissions ?? []]))
+    for (const role of roles) {
+      // oxlint-disable-next-line typescript/no-misused-spread -- 实体实例挂计算字段，响应走 JSON 序列化
+      Object.assign(role, { permissions: byId.get(role.id) ?? [] })
+    }
+    return roles
+  }
+
+  /** 角色下拉选项：只暴露 id/名称/编码，供用户表单分配角色、列表筛选（登录即可用，不含授权明细）；停用角色不给新分配 */
+  async listOptions(): Promise<Array<{ id: string; roleCode: string; roleName?: string }>> {
+    const qb = this.roleRepository
+      .createQueryBuilder('role')
+      .select(['role.id', 'role.roleCode', 'role.roleName'])
+      .where('role.status = 1')
+      .orderBy('role.createTime', 'ASC')
+    applyTenantScope(qb, 'role')
+    return qb.getMany()
+  }
+
+  /** 创建角色，支持 menuIds 绑定菜单权限（id 由 BaseService 自动生成 32 位） */
+  async createRole(dto: CreateRoleDto): Promise<RoleEntity> {
+    // 超管编码是内置约定，不允许新建同名角色（否则 @Roles() 与历史数据会产生歧义）
+    if (isSuperRole(dto.roleCode)) {
+      throw new BizException(BizErrorCode.BUILTIN_ROLE_PROTECTED, `「${dto.roleCode}」是内置超级管理员角色编码，不允许创建`, HttpStatus.BAD_REQUEST)
+    }
+    // 归属租户：必须显式打标 —— 实体默认 tenant_id=0（平台共享），
+    // 不打标的话租户管理员建的角色会变成「全平台共享角色」，出现在所有租户的角色列表里
+    const tenantId = TenantContext.filterTenantId() ?? 0
+    await this.assertCodeAvailable(dto.roleCode, tenantId)
+    // 角色本体与授权关系同一个事务：避免「角色建好了但菜单一条没绑」的半成品
+    const roleId = await this.roleRepository.manager.transaction(async manager => {
+      const repo = manager.getRepository(RoleEntity)
+      const role = await repo.save(
+        repo.create({
+          // 主键是 varchar(32) 且无数据库默认值，必须显式生成（与 BaseService.create 行为一致）
+          id: randomId32(),
+          roleName: dto.roleName,
+          roleCode: dto.roleCode,
+          description: dto.description,
+          dataScope: dto.dataScope ?? 1,
+          status: dto.status ?? 1,
+          tenantId,
+          isBuiltin: 0,
+          createTime: new Date()
+        })
+      )
+      if (dto.menuIds?.length) {
+        await this.assignMenus(role.id, dto.menuIds, manager)
+      }
+      return role.id
+    })
+    return this.findOneWithMenus(roleId)
+  }
+
+  /** 更新角色基础信息，可同时传 menuIds 覆盖授权；内置角色的编码不允许修改 */
+  async updateRole(id: string, dto: UpdateRoleDto): Promise<RoleEntity> {
+    const role = await this.findWritableRole(id)
+    if (dto.roleCode && dto.roleCode !== role.roleCode) {
+      if (role.isBuiltin === 1) {
+        throw new BizException(BizErrorCode.BUILTIN_ROLE_PROTECTED, '内置管理员角色的编码不允许修改', HttpStatus.BAD_REQUEST)
+      }
+      if (isSuperRole(dto.roleCode)) {
+        throw new BizException(BizErrorCode.BUILTIN_ROLE_PROTECTED, `「${dto.roleCode}」是内置超级管理员角色编码，不允许占用`, HttpStatus.BAD_REQUEST)
+      }
+      await this.assertCodeAvailable(dto.roleCode, role.tenantId)
+    }
+    // 内置角色是权限体系的兜底，停用它会把所有管理员锁在门外
+    if (dto.status === 0 && role.isBuiltin === 1) {
+      throw new BizException(BizErrorCode.BUILTIN_ROLE_PROTECTED, '内置管理员角色不允许停用', HttpStatus.BAD_REQUEST)
+    }
+    // 数据范围同理：内置管理员一旦被改成「仅本人」，租户里就再没有能管全部数据的人了，
+    // 而且页面上没有任何入口能改回来（只能改库）。停用拦了、数据范围也得拦。
+    if (dto.dataScope !== undefined && role.isBuiltin === 1 && dto.dataScope !== 1) {
+      throw new BizException(BizErrorCode.BUILTIN_ROLE_PROTECTED, '内置管理员角色的数据范围固定为「全部」，不允许修改', HttpStatus.BAD_REQUEST)
+    }
+    const writeTenantId = TenantContext.filterTenantId()
+    await this.roleRepository.manager.transaction(async manager => {
+      await manager.getRepository(RoleEntity).update(
+        { id, ...(writeTenantId !== null ? { tenantId: writeTenantId } : {}) },
+        {
+          roleName: dto.roleName,
+          roleCode: dto.roleCode,
+          description: dto.description,
+          // 数据范围/状态只接受显式传入；undefined 表示本次不改（前端没传别把已有配置冲掉）
+          ...(dto.dataScope !== undefined ? { dataScope: dto.dataScope } : {}),
+          ...(dto.status !== undefined ? { status: dto.status } : {}),
+          updateTime: new Date()
+        }
+      )
+      if (dto.menuIds) {
+        await this.assignMenus(id, dto.menuIds, manager)
+      }
+    })
+    // 状态 / 数据范围都在「鉴权用户缓存」的 roles 里（validate 会用 status 过滤有效角色、dataScope 决定可见范围），
+    // 这两项一变必须全局失效；名称/描述这类字段不影响鉴权，不动缓存
+    if (dto.status !== undefined || dto.dataScope !== undefined) {
+      this.authUserCache.invalidateAll()
+    }
+    return this.findOneWithMenus(id)
+  }
+
+  /**
+   * 删除角色（硬删）
+   * 保护规则：内置 admin 角色不可删；角色下仍有**未删除**用户时拒绝，需先解绑；
+   * 删除前清理 sys_role_permission 关联行，避免外键约束残留
+   *
+   * 注意「仍有用户」的口径：只统计 del_flag = 0 的用户。
+   * 之前用关联表条数判断，软删用户会一直占着 sys_user_role，导致角色永久删不掉而界面上又找不到那个用户。
+   */
+  async deleteRole(id: string): Promise<void> {
+    const role = await this.findWritableRole(id)
+    if (role.isBuiltin === 1) {
+      throw new BizException(BizErrorCode.BUILTIN_ROLE_PROTECTED, '内置管理员角色不允许删除', HttpStatus.BAD_REQUEST)
+    }
+    const rows = (await queryRaw(
+      this.roleRepository,
+      'SELECT COUNT(*) AS total FROM sys_user_role ur INNER JOIN sys_user u ON u.id = ur.user_id WHERE ur.role_id = ? AND u.del_flag = 0',
+      [id]
+    )) as Array<{ total: number | string }>
+    const activeUsers = Number(rows?.[0]?.total ?? 0)
+    if (activeUsers > 0) {
+      throw new BadRequestException(`该角色下还有 ${activeUsers} 个用户，请先解绑后再删除`)
+    }
+    const writeTenantId = TenantContext.filterTenantId()
+    await this.roleRepository.manager.transaction(async manager => {
+      const repo = manager.getRepository(RoleEntity)
+      // 历史软删用户可能仍残留关联行，一并清掉，避免外键拦路
+      await queryRaw(manager, 'DELETE FROM sys_user_role WHERE role_id = ?', [id])
+      const menus = await repo.createQueryBuilder().relation(RoleEntity, 'permissions').of(id).loadMany<MenuEntity>()
+      if (menus.length) {
+        await repo
+          .createQueryBuilder()
+          .relation(RoleEntity, 'permissions')
+          .of(id)
+          .remove(menus.map(menu => menu.id))
+      }
+      await repo.delete({ id, ...(writeTenantId !== null ? { tenantId: writeTenantId } : {}) })
+    })
+    await this.permissionCache.invalidateRole(id)
+    // 持有者缓存里的 roles 还留着这个已删角色（RolesGuard 直接读它）
+    this.authUserCache.invalidateAll()
+  }
+
+  /** 批量删除角色：逐条走 deleteRole，保留「内置角色 / 有用户不可删」的保护并收集原因 */
+  async batchDelete(ids: string[]): Promise<BatchDeleteResult> {
+    // 目标集合按严格写范围收窄：跨租户/共享角色不进入结果，失败信息里也不会带出对方的角色名
+    const qb = this.roleRepository.createQueryBuilder('role').where('role.id IN (:...ids)', { ids: normalizeBatchIds(ids) })
+    const condition = tenantWriteCondition('role.tenant_id')
+    if (condition) qb.andWhere(condition.clause, condition.params)
+    const targets = await qb.getMany()
+    return runBatchDelete(
+      targets,
+      {
+        getId: role => role.id,
+        getName: role => role.roleName,
+        remove: role => this.deleteRole(role.id)
+      },
+      ids
+    )
+  }
+
+  /**
+   * 绑定菜单权限（全量覆盖：多退少补）
+   *
+   * 超管角色直接拒绝：其权限来自内置规则（不读关联表），写入既不生效又会产生误导数据。
+   */
+  async assignMenus(id: string, menuIds: string[], manager?: EntityManager): Promise<void> {
+    // 有事务时必须用事务内的仓库：刚插入的角色在别的连接上还看不到，用默认连接校验会误判「角色不存在」
+    const roleRepo = manager ? manager.getRepository(RoleEntity) : this.roleRepository
+    // 授权是写操作：必须按严格写范围加载角色。否则拿到别家（或共享角色）的 id 就能直接改授权，
+    // 控制器事后再用带范围的 getMenuIds 回显只会 404，但写入已经发生。
+    const role = await this.findWritableRole(id, roleRepo)
+    if (role.isBuiltin === 1) {
+      throw new BadRequestException('内置超级管理员拥有全部权限，无需也不允许分配，修改不会生效')
+    }
+    const menus = await (manager ?? this.roleRepository.manager).getRepository(MenuEntity).find({ where: { id: In(menuIds) } })
+    if (menus.length !== menuIds.length) {
+      throw new BizException(BizErrorCode.MENU_IDS_INVALID, '存在无效的菜单 ID', HttpStatus.NOT_FOUND)
+    }
+    // 平台级菜单（租户管理/菜单管理/运维监控）不能由租户管理员授权给自己：
+    // 即使权限码拿不到，也避免关联表里出现「看起来有、实际 403」的脏数据
+    if (!TenantContext.isSuper()) {
+      const platformNode = menus.find(menu => menu.scope === 'platform')
+      if (platformNode) {
+        throw new BadRequestException(`「${platformNode.name}」是平台级菜单，仅平台管理员可授权`)
+      }
+    }
+    // 功能套餐上限：租户角色只能授「已开通给该租户」的菜单（平台管理员编辑租户角色同样受限——
+    // 想加菜单先调 PUT /v1/tenants/:id/menus 扩套餐）。套餐来自 sys_tenant_menu（开通/初始化租户时写入）；
+    // 平台级角色（tenant_id=0/null）无套餐概念。这是「租户管理员偷偷给自己加未购买功能」的最后一道闸。
+    const roleTenantId = Number(role.tenantId ?? 0)
+    if (roleTenantId > 0) {
+      const packageRows = await queryRaw<Array<{ pid: string }>>(roleRepo.manager, 'SELECT permission_id AS pid FROM sys_tenant_menu WHERE tenant_id = ?', [
+        roleTenantId
+      ])
+      const packageIds = new Set(packageRows.map(row => row.pid))
+      const outside = menus.filter(menu => !packageIds.has(menu.id))
+      if (outside.length) {
+        throw new BadRequestException(`「${outside[0].name}」未开通给该租户，请先由平台管理员调整功能套餐`)
+      }
+    }
+    const nextIds = new Set(menuIds)
+    const current = await roleRepo.createQueryBuilder().relation(RoleEntity, 'permissions').of(id).loadMany<MenuEntity>()
+    const currentIds = new Set(current.map(menu => menu.id))
+    // 只新增差集、删除差集，避免重复插入关联行
+    const toAdd = menus.filter(menu => !currentIds.has(menu.id))
+    const toRemove = current.filter(menu => !nextIds.has(menu.id))
+    await roleRepo.createQueryBuilder().relation(RoleEntity, 'permissions').of(id).addAndRemove(toAdd, toRemove)
+
+    // 授权变了：该角色的权限集合缓存立即失效，保证「改完马上生效」
+    // 事务内调用也安全：即使外层回滚，缓存只是被删掉，下次请求回源自愈
+    await this.permissionCache.invalidateRole(id)
+  }
+
+  /** 查角色详情（含菜单权限）—— 按 id 直读必须带租户范围，否则拿到别家 roleId 就能读到对方角色 */
+  async findOneWithMenus(id: string): Promise<RoleEntity> {
+    const qb = this.roleRepository.createQueryBuilder('role').leftJoinAndSelect('role.permissions', 'perm').where('role.id = :id', { id })
+    applyTenantScope(qb, 'role')
+    const role = await qb.getOne()
+    if (!role) {
+      throw new NotFoundException('角色不存在')
+    }
+    return role
+  }
+
+  /**
+   * 角色已授权的菜单/按钮 id 列表（授权弹窗回显）
+   *
+   * 超管角色返回**全部**菜单 id：其真实权限就是全量（内置规则），
+   * 若按关联表返回「几条脏数据」，前端会显示「已授权 2 项」这种与实际不符的信息。
+   */
+  async getMenuIds(id: string): Promise<string[]> {
+    const role = await this.findOne(id)
+    if (role.isBuiltin === 1) {
+      // 只回显未删除的菜单（与菜单树同源，已软删的节点在树上不存在，回显了也勾不上）；
+      // 租户视角还要滤掉 platform 级菜单 —— 那些页面对租户本来就不可见（AuthService.getPermissions），
+      // 回显成全勾会让管理员以为「我能改菜单」，点进去却是 403。
+      const menus = await this.roleRepository.manager.getRepository(MenuEntity).find({
+        select: { id: true },
+        where: { delFlag: 0, ...(TenantContext.isSuper() ? {} : { scope: Not('platform') }) }
+      })
+      return menus.map(menu => menu.id)
+    }
+    const detail = await this.findOneWithMenus(id)
+    return (detail.permissions ?? []).map(menu => menu.id)
+  }
+
+  /** 按 id 列表查角色 */
+  async findByIds(ids: string[]): Promise<RoleEntity[]> {
+    return this.roleRepository.findBy({ id: In(ids) })
+  }
+
+  /** 导出角色（与列表同过滤条件，全量不分页；角色数量少，不做上限截断） */
+  async exportRoles(query: QueryRoleDto): Promise<RoleEntity[]> {
+    // 导出是全量（不分页）：列表分页只影响浏览，导出必须覆盖筛选后的所有行
+    return this.attachTenantNames(await this.buildRoleQuery(query).getMany())
+  }
+
+  /**
+   * 导入角色（入参为已解析的二维表格数据，xlsx/csv 由 controller 负责解析）
+   * - 新增：roleName/roleCode/description 入库，不绑定菜单权限
+   * - 已存在：只覆盖 roleName/description（不传 description 则保持原值），已有授权不受影响
+   * - 单行失败不影响其他行，最终返回统计 + 失败明细
+   * - headerRowNumber：表头在 Excel 中的真实行号，用于把「第几行出错」报准
+   */
+  async importRoles(rows: string[][], headerRowNumber = 1): Promise<RoleImportResult> {
+    if (!rows.length) {
+      throw new BizException(BizErrorCode.IMPORT_EMPTY, '文件内容为空，请下载模板后填写', HttpStatus.BAD_REQUEST)
+    }
+
+    const { columns, dataRows } = this.resolveImportColumns(rows, headerRowNumber)
+    if (!columns.roleCode) {
+      throw new BizException(BizErrorCode.IMPORT_HEADER_MISMATCH, '未找到「角色编码」列，请使用导入模板的表头', HttpStatus.BAD_REQUEST)
+    }
+    if (!dataRows.length) {
+      throw new BizException(BizErrorCode.IMPORT_EMPTY, '表头下方没有数据行，请填写后再导入', HttpStatus.BAD_REQUEST)
+    }
+    if (dataRows.length > ROLE_IMPORT_MAX_ROWS) {
+      throw new BadRequestException(`单次最多导入 ${ROLE_IMPORT_MAX_ROWS} 行，当前 ${dataRows.length} 行，请拆分后重试`)
+    }
+
+    // 匹配范围必须收进「当前租户可见」（本租户 + 平台共享）：原来 find() 全表，
+    // 租户 B 导入一个与租户 A 同码的角色会直接 update 到 A 的行上（实测可复现）。
+    const scopeQb = this.roleRepository.createQueryBuilder('role')
+    applyTenantScope(scopeQb, 'role')
+    const existing = await scopeQb.getMany()
+    const existingByCode = new Map(existing.map(role => [role.roleCode, role]))
+    /** 当前租户：>0 时命中 tenant_id=0 的平台角色属于「撞内置编码」，只能报错不能改 */
+    const importTenantId = TenantContext.filterTenantId()
+    /** 文件内已处理过的编码，重复行直接跳过（避免同一份文件里互相覆盖） */
+    const seenCodes = new Set<string>()
+    const result: RoleImportResult = { total: dataRows.length, created: 0, updated: 0, skipped: 0, failed: 0, errors: [] }
+
+    for (const { rowNumber, cells } of dataRows) {
+      const roleCode = (cells[columns.roleCode] ?? '').trim()
+      const roleName = columns.roleName === undefined ? '' : (cells[columns.roleName] ?? '').trim()
+      const description = columns.description === undefined ? undefined : (cells[columns.description] ?? '').trim()
+
+      const fail = (message: string) => {
+        result.failed += 1
+        result.errors.push({ row: rowNumber, roleCode, message })
+      }
+
+      if (!roleCode) {
+        fail('角色编码不能为空')
+        continue
+      }
+      if (roleCode.length > 100 || !ROLE_CODE_PATTERN.test(roleCode)) {
+        fail('角色编码需字母开头，只能包含字母/数字/下划线/冒号/点/短横线，且不超过 100 个字符')
+        continue
+      }
+
+      const current = existingByCode.get(roleCode)
+      if (seenCodes.has(roleCode)) {
+        result.skipped += 1
+        result.errors.push({ row: rowNumber, roleCode, message: '文件内角色编码重复，本行已跳过' })
+        continue
+      }
+      seenCodes.add(roleCode)
+      // 命中平台共享角色（tenant_id=0）时不能改：那是全平台共用的内置定义，改一处等于改所有租户
+      if (current && importTenantId !== null && Number(current.tenantId ?? 0) !== importTenantId) {
+        fail('与平台内置角色编码冲突，请更换编码')
+        continue
+      }
+      try {
+        if (current) {
+          await this.roleRepository.update(current.id, {
+            roleName: roleName || current.roleName,
+            // 空白描述视为「未填写」，保留原值，避免导入把已有备注清空
+            description: description === undefined || description === '' ? current.description : description
+          })
+          result.updated += 1
+        } else {
+          const created = await this.create({ roleName: roleName || roleCode, roleCode, description: description || undefined, createTime: new Date() })
+          existingByCode.set(roleCode, created)
+          result.created += 1
+        }
+      } catch (error) {
+        fail(error instanceof Error ? error.message : '写入失败')
+      }
+    }
+
+    return result
+  }
+
+  /** 解析导入文件的列位置：有表头按表头名定位，无表头按「角色名称,角色编码,描述」固定顺序 */
+  private resolveImportColumns(
+    rows: string[][],
+    headerRowNumber = 1
+  ): {
+    columns: { roleName?: number; roleCode?: number; description?: number }
+    dataRows: Array<{ rowNumber: number; cells: string[] }>
+  } {
+    const aliases = {
+      roleName: ['角色名称', '角色名', 'rolename', 'name'],
+      roleCode: ['角色编码', '权限字符', 'rolecode', 'code'],
+      description: ['描述', '备注', 'description', 'remark']
+    }
+    // 表头可能带必填标记（「角色编码 *」）或前后空格，归一化后比较
+    const header = rows[0].map(cell => cell.replace(/[\s*＊]/g, '').toLowerCase())
+    const pick = (keys: string[]) => {
+      const index = header.findIndex(cell => keys.includes(cell))
+      return index >= 0 ? index : undefined
+    }
+    const columns = { roleName: pick(aliases.roleName), roleCode: pick(aliases.roleCode), description: pick(aliases.description) }
+
+    // 表头行必须至少命中一个已知列，否则视为无表头的数据文件（行号取 Excel 真实行号，方便用户对照定位）
+    const hasHeader = columns.roleName !== undefined || columns.roleCode !== undefined || columns.description !== undefined
+    if (hasHeader) {
+      return { columns, dataRows: rows.slice(1).map((cells, index) => ({ rowNumber: headerRowNumber + index + 1, cells })) }
+    }
+    return {
+      columns: { roleName: 0, roleCode: 1, description: 2 },
+      dataRows: rows.map((cells, index) => ({ rowNumber: headerRowNumber + index, cells }))
+    }
+  }
+
+  /**
+   * 写路径加载角色：必须落在「严格租户写范围」内。
+   *
+   * - 平台视角（filterTenantId = null）：可写任意角色，含 tenant_id=0 的共享角色
+   * - 租户视角（>0）：只能写本租户的角色，共享角色一律按不存在处理
+   * - 无租户归属（0）：只能写共享角色
+   *
+   * 读路径（BaseService.findOne）包含 tenant_id=0，不能直接拿来做写前的存在性判断；
+   * 这里单独查一次，和 tenantWriteCondition 的语义保持一致。
+   */
+  private async findWritableRole(id: string, repo: Repository<RoleEntity> = this.roleRepository): Promise<RoleEntity> {
+    const tenantId = TenantContext.filterTenantId()
+    const role = await repo.findOne({ where: tenantId === null ? { id } : { id, tenantId } })
+    if (!role) {
+      throw new NotFoundException('角色不存在')
+    }
+    return role
+  }
+
+  /** 校验角色编码未被占用（数据库有唯一索引，提前拦截给出可读报错） */
+  /**
+   * 同一租户内角色编码唯一（数据库联合唯一键 `(tenant_id, role_code)` 兜底）
+   *
+   * 之前是全局查重 + 全局唯一索引：租户 B 永远建不了自己的 `operator` 编码。
+   * 现在按「这一行将要落到哪个租户」查重；软删的角色同样占唯一键，所以不带 del_flag 条件。
+   */
+  private async assertCodeAvailable(roleCode: string, tenantId: number): Promise<void> {
+    const exists = await this.roleRepository.findOne({ where: { roleCode, tenantId } })
+    if (exists) {
+      throw new BizException(BizErrorCode.ROLE_CODE_CONFLICT, `角色编码「${roleCode}」已存在`, HttpStatus.BAD_REQUEST)
+    }
+  }
+}

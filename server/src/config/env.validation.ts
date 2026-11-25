@@ -1,0 +1,212 @@
+import { plainToInstance } from 'class-transformer'
+import { IsIn, IsNumberString, IsOptional, IsString, Matches, MinLength, validateSync } from 'class-validator'
+
+/** 布尔型环境变量允许的写法（与 global/env.ts 的 envBoolean 保持一致） */
+const BOOLEAN_STRINGS = ['true', 'false', '1', '0', 'on', 'off', 'yes', 'no']
+
+/**
+ * 环境变量 schema（启动期校验）
+ *
+ * 目标：配置错误在**进程启动时**暴露，而不是等第一个请求打到 JWT 签名/数据库连接才 500。
+ * 只校验「缺失/格式」，不负责转换类型 —— 类型转换在各 *.config.ts 里用 global/env.ts 完成。
+ *
+ * 加字段的规矩：新增环境变量时同步在此声明，可选配置用 @IsOptional，必填配置不加。
+ */
+class EnvironmentVariables {
+  @IsOptional()
+  @IsNumberString({}, { message: 'PORT 必须是数字' })
+  PORT?: string
+
+  @IsOptional()
+  @IsString()
+  API_PREFIX?: string
+
+  @IsOptional()
+  @IsIn(['mysql', 'postgres'], { message: 'DB_TYPE 只能是 mysql/postgres' })
+  DB_TYPE?: 'mysql' | 'postgres'
+
+  @IsOptional()
+  @IsString()
+  DB_HOST?: string
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'DB_PORT 必须是数字' })
+  DB_PORT?: string
+
+  @IsOptional()
+  @IsString()
+  DB_USERNAME?: string
+
+  @IsOptional()
+  @IsString()
+  DB_PASSWORD?: string
+
+  @IsOptional()
+  @IsString()
+  DB_DATABASE?: string
+
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'DB_SYNCHRONIZE 只能是 true/false/1/0/on/off/yes/no' })
+  DB_SYNCHRONIZE?: string
+
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'DB_LOGGING 只能是 true/false/1/0/on/off/yes/no' })
+  DB_LOGGING?: string
+
+  /** accessToken 密钥：必填，太短等于没加密 */
+  @IsString({ message: '缺少 JWT_SECRET（accessToken 签名密钥）' })
+  @MinLength(16, { message: 'JWT_SECRET 长度至少 16 位' })
+  JWT_SECRET!: string
+
+  @IsOptional()
+  @Matches(/^\d+[smhd]$/, { message: 'JWT_EXPIRES_IN 格式应为 2h / 30m / 7d 这类' })
+  JWT_EXPIRES_IN?: string
+
+  /** refreshToken 密钥：必填，且应与 JWT_SECRET 不同（启动期只校验存在与长度） */
+  @IsString({ message: '缺少 JWT_REFRESH_SECRET（refreshToken 签名密钥）' })
+  @MinLength(16, { message: 'JWT_REFRESH_SECRET 长度至少 16 位' })
+  JWT_REFRESH_SECRET!: string
+
+  @IsOptional()
+  @Matches(/^\d+[smhd]$/, { message: 'JWT_REFRESH_EXPIRES_IN 格式应为 2h / 30m / 7d 这类' })
+  JWT_REFRESH_EXPIRES_IN?: string
+
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'CAPTCHA_ENABLED 只能是 true/false/1/0/on/off/yes/no' })
+  CAPTCHA_ENABLED?: string
+
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'REDIS_ENABLED 只能是 true/false/1/0/on/off/yes/no' })
+  REDIS_ENABLED?: string
+
+  @IsOptional()
+  @IsString()
+  REDIS_HOST?: string
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'REDIS_PORT 必须是数字' })
+  REDIS_PORT?: string
+
+  @IsOptional()
+  @IsString()
+  REDIS_PASSWORD?: string
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'REDIS_DB 必须是数字' })
+  REDIS_DB?: string
+
+  /** 反向代理信任范围：false / true / 跳数 / 受信网段串（默认只信 loopback） */
+  @IsOptional()
+  @IsString()
+  TRUST_PROXY?: string
+
+  /** 是否开启 Swagger 文档（默认非生产开启） */
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'SWAGGER_ENABLED 只能是 true/false/1/0/on/off/yes/no' })
+  SWAGGER_ENABLED?: string
+
+  /** 是否注册旧版（无 /v1 前缀）路由：默认关闭，仅兼容老客户端时临时打开 */
+  @IsOptional()
+
+  /** 是否开启全局限流 */
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'RATE_LIMIT_ENABLED 只能是 true/false/1/0/on/off/yes/no' })
+  RATE_LIMIT_ENABLED?: string
+
+  /** 全局默认限流阈值：窗口内允许的请求数 */
+  @IsOptional()
+  @IsNumberString({}, { message: 'RATE_LIMIT_LIMIT 必须是数字' })
+  RATE_LIMIT_LIMIT?: string
+
+  /** 全局默认限流窗口（秒） */
+  @IsOptional()
+  @IsNumberString({}, { message: 'RATE_LIMIT_WINDOW 必须是数字' })
+  RATE_LIMIT_WINDOW?: string
+
+  /** 全局限流维度：ip（默认）/ tenant；account 在 JWT 前无效，故意不开放 */
+  @IsOptional()
+  @IsIn(['ip', 'tenant'], { message: 'RATE_LIMIT_BY 只能是 ip 或 tenant' })
+  RATE_LIMIT_BY?: string
+
+  /** 登录失败锁定阈值：同账号连续密码错误多少次后锁定（默认 5） */
+  @IsOptional()
+  @IsNumberString({}, { message: 'LOGIN_MAX_FAILS 必须是数字' })
+  LOGIN_MAX_FAILS?: string
+
+  /** 登录失败锁定时长（小时，默认 24 即锁一天） */
+  @IsOptional()
+  @IsNumberString({}, { message: 'LOGIN_LOCK_HOURS 必须是数字' })
+  LOGIN_LOCK_HOURS?: string
+
+  // ── OIDC / SSO 单点登录（src/config/oidc.config.ts）─────────────────────────
+
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'OIDC_ENABLED 只能是 true/false/1/0/on/off/yes/no' })
+  OIDC_ENABLED?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_ISSUER?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_CLIENT_ID?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_CLIENT_SECRET?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_SCOPE?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_REDIRECT_URI?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_ALLOWED_HOSTS?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_FRONTEND_REDIRECT?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_USERNAME_CLAIM?: string
+
+  @IsOptional()
+  @IsIn(BOOLEAN_STRINGS, { message: 'OIDC_AUTO_CREATE 只能是 true/false/1/0/on/off/yes/no' })
+  OIDC_AUTO_CREATE?: string
+
+  @IsOptional()
+  @IsString()
+  OIDC_DEFAULT_ROLES?: string
+}
+
+/**
+ * 传给 ConfigModule.forRoot({ validate }) 的校验函数
+ * 校验失败直接抛错 → bootstrap 中断，不会带着错误配置跑起来
+ */
+export function validateEnv(config: Record<string, unknown>): Record<string, unknown> {
+  const instance = plainToInstance(EnvironmentVariables, config, { enableImplicitConversion: false })
+  const errors = validateSync(instance, { skipMissingProperties: false })
+
+  if (errors.length > 0) {
+    const details = errors
+      .map(error => Object.values(error.constraints ?? {}).join('；'))
+      .filter(Boolean)
+      .map(text => `  - ${text}`)
+      .join('\n')
+    throw new Error(`环境变量校验未通过，请检查 .env：\n${details}`)
+  }
+
+  // accessToken 与 refreshToken 必须使用不同密钥：相同则 refreshToken 可被当作 accessToken
+  // 直接用于授权，令牌分级失效（一个泄露等于两个都泄露）。
+  if (config.JWT_SECRET === config.JWT_REFRESH_SECRET) {
+    throw new Error('环境变量校验未通过：JWT_SECRET 与 JWT_REFRESH_SECRET 不能相同')
+  }
+
+  return config
+}
