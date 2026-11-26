@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger'
 import { Type } from 'class-transformer'
-import { ArrayMinSize, IsArray, IsDateString, IsEmail, IsIn, IsOptional, IsString, Length, MaxLength } from 'class-validator'
+import { IsArray, IsDateString, IsEmail, IsIn, IsOptional, IsString, Length, MaxLength } from 'class-validator'
 
 export class CreateUserDto {
   @ApiProperty({ description: '登录账号（唯一，3~100 位；密码算法绑定账号，创建后不可改）', example: 'zhangsan', minLength: 3, maxLength: 100 })
@@ -63,10 +63,13 @@ export class CreateUserDto {
   @IsIn([1, 2])
   status?: number
 
-  @ApiPropertyOptional({ description: '角色 ID 列表（sys_role.id，32 位字符串）；传了就必须至少 1 个', example: ['f6817f48af4fb3af11b9e8bf182f618b'], type: [String] })
+  @ApiPropertyOptional({
+    description: '角色 ID 列表（sys_role.id，32 位字符串）。不传 = 新建不分配、编辑不改动；空数组 = 新建不分配、编辑清空全部角色；非空数组 = 绑定指定角色',
+    example: ['f6817f48af4fb3af11b9e8bf182f618b'],
+    type: [String]
+  })
   @IsOptional()
   @IsArray({ message: '角色必须是数组' })
-  @ArrayMinSize(1, { message: '请至少选择 1 个角色' })
   @IsString({ each: true, message: '每个角色 ID 必须是字符串' })
   roleIds?: string[]
 

@@ -168,9 +168,8 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
       workNo: form.workNo || undefined,
       sex: form.sex,
       status: form.status,
-      // 新建且一个角色都没选时不下发（后端 IsOptional 才生效，传空数组会触发「至少 1 个」校验）；
-      // 编辑时照常下发，空数组表示「清空角色」（与部门、岗位语义一致）
-      ...(form.roleIds.length || user ? { roleIds: form.roleIds } : {}),
+      // 与后端约定一致：不传 = 不改动（编辑）/ 不分配（新建），空数组 = 清空角色；这里统一总是传
+      roleIds: form.roleIds,
       deptIds: form.deptIds,
       postIds: form.postIds,
       // 职级：'' = 未设置，置 null 让后端清掉
