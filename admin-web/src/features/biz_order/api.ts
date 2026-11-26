@@ -10,13 +10,16 @@ export interface BizOrder {
   remark?: string | null
   createBy?: string | null
   updateBy?: string | null
+  /** 后端响应层把 createBy/updateBy 的 ID 翻译成的展示名（姓名优先，回退账号）；查不到对应用户时无此字段 */
+  createByName?: string
+  updateByName?: string
   createdAt: string
   updatedAt: string
   /** 后端按字段权限移除的敏感字段名（如 amount），前端只展示掩码，不回填表单 */
   maskedFields?: string[]
 }
 
-export type BizOrderWritePayload = Partial<Omit<BizOrder, 'id' | 'createBy' | 'updateBy' | 'createdAt' | 'updatedAt' | 'maskedFields'>>
+export type BizOrderWritePayload = Partial<Omit<BizOrder, 'id' | 'createBy' | 'updateBy' | 'createByName' | 'updateByName' | 'createdAt' | 'updatedAt' | 'maskedFields'>>
 
 export function fetchBizOrders(params: { page?: number; pageSize?: number; keyword?: string; sortBy?: string; sortOrder?: 'asc' | 'desc' } = {}) {
   const qs = new URLSearchParams()

@@ -125,6 +125,22 @@ export class PreviewCodegenDto {
   @Matches(/^[A-Z][A-Za-z0-9]{1,31}$/, { message: '图标须为 lucide 组件名（PascalCase）' })
   icon?: string
 
+  @ApiPropertyOptional({
+    description: '是否生成 create_by/update_by 归属列并回退角色 data_scope；false = 无归属列，只应用显式数据规则（无规则时租户内全可见），默认 true',
+    example: true
+  })
+  @IsOptional()
+  @IsBoolean()
+  owner?: boolean
+
+  @ApiPropertyOptional({
+    description: '是否在列表页展示审计列（创建人/更新人/创建时间/更新时间）；false = 不生成这四列，默认 true',
+    example: true
+  })
+  @IsOptional()
+  @IsBoolean()
+  audit?: boolean
+
   @ApiProperty({ description: '字段定义（至少 1 个，最多 40 个）', type: [CodegenFieldDto] })
   @IsArray()
   @ArrayMinSize(1, { message: '至少定义一个业务字段' })

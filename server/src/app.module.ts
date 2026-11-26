@@ -65,6 +65,8 @@ import { FeatureModule } from './shared/feature/feature.module'
 import { MeteringModule } from './modules/metering/metering.module'
 import { MeteringInterceptor } from './modules/metering/metering.interceptor'
 import { SensitiveInterceptor } from './common/interceptors/sensitive.interceptor'
+import { AuditNameInterceptor } from './common/interceptors/audit-name.interceptor'
+import { UserDictModule } from './shared/user-dict/user-dict.module'
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule()
 
@@ -85,6 +87,8 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule()
     RateLimitModule,
     // 权限集合缓存（按角色，Redis 优先，写侧主动失效），全局模块
     PermissionCacheModule,
+    // 用户名字典（审计字段 ID→姓名，60 秒进程内缓存），全局模块
+    UserDictModule,
     // 鉴权用户短缓存（JwtStrategy 读、账号写路径主动失效），全局模块
     AuthCacheModule,
     // 例外授权与数据规则（窄口径 ABAC：主体授权行 + 规则翻译成 SQL），全局模块
@@ -164,6 +168,8 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule()
     { provide: APP_INTERCEPTOR, useClass: MeteringInterceptor },
     // 字段级脱敏最靠近 handler：改的是原始数据，外层再统一包装 {code,result}
     { provide: APP_INTERCEPTOR, useClass: SensitiveInterceptor },
+    // 审计人名字段（createBy → createByName）：与脱敏同属原始数据层，注册在其内侧
+    { provide: APP_INTERCEPTOR, useClass: AuditNameInterceptor },
     // Prometheus HTTP 指标已移到 express 层中间件（main.ts registerHttpMetrics）：
     // 拦截器在 Guard 之后执行，守卫拒绝的请求统计不到，且 tap(next) 取不到真实状态码。
     // 全局守卫：先限流（最便宜的拒绝），再 JWT 认证（@Public() 放行），再角色鉴权（@Roles()），再按钮级权限（@Perms()），最后开放接口 scope（@ApiScope()，只约束应用令牌）

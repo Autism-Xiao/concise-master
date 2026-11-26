@@ -95,6 +95,7 @@ export function SupplierPage() {
                     <th className="px-3 py-2 font-medium">联系人</th>
                     <th className="px-3 py-2 font-medium">级别</th>
                     <th className="px-3 py-2 font-medium">备注</th>
+                    <th className="px-3 py-2 font-medium">创建 / 更新时间</th>
                     <th className="table-sticky-action w-24 px-3 py-2 font-medium">操作</th>
                   </tr>
                 </thead>
@@ -106,6 +107,12 @@ export function SupplierPage() {
                       <td className="px-3 py-2 text-sm">{row.contact ?? '-'}</td>
                       <td className="px-3 py-2 text-sm">{row.level ?? '-'}</td>
                       <td className="px-3 py-2 text-sm">{row.remark ?? '-'}</td>
+                      <td className="px-3 py-2 text-sm tabular-nums">
+                        <div className="space-y-0.5 whitespace-nowrap">
+                          <div>{String(row.createdAt ?? '').replace('T', ' ').slice(0, 16) || '-'}</div>
+                          <div>{String(row.updatedAt ?? '').replace('T', ' ').slice(0, 16) || '-'}</div>
+                        </div>
+                      </td>
                       <td className="table-sticky-action px-3 py-2">
                         <div className="flex items-center gap-1">
                           {canEdit && (
@@ -124,7 +131,7 @@ export function SupplierPage() {
                   ))}
                   {list.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="text-muted-foreground py-10 text-center text-sm">
+                      <td colSpan={7} className="text-muted-foreground py-10 text-center text-sm">
                         暂无数据
                       </td>
                     </tr>

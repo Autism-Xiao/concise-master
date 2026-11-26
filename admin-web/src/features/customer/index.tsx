@@ -26,6 +26,8 @@ const columnLabels: Record<string, string> = {
   level: '级别',
   vip: '客户等级',
   remark: '备注',
+  auditUser: '创建人 / 更新人',
+  auditTime: '创建 / 更新时间',
   actions: '操作'
 }
 
@@ -91,6 +93,28 @@ export function CustomerPage() {
         cell: ({ row }) => {
           return <span className="text-muted-foreground block max-w-64 truncate">{row.getValue('remark') || '-'}</span>
         }
+      },
+      {
+        id: 'auditUser',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="创建人 / 更新人" />,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <div className="space-y-0.5 whitespace-nowrap">
+            <div>建 {row.original.createByName || row.original.createBy || '-'}</div>
+            <div>更 {row.original.updateByName || row.original.updateBy || '-'}</div>
+          </div>
+        )
+      },
+      {
+        id: 'auditTime',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="创建 / 更新时间" />,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <div className="space-y-0.5 tabular-nums whitespace-nowrap">
+            <div>{String(row.original.createdAt ?? '').replace('T', ' ').slice(0, 16) || '-'}</div>
+            <div>{String(row.original.updatedAt ?? '').replace('T', ' ').slice(0, 16) || '-'}</div>
+          </div>
+        )
       },
       {
         id: 'actions',

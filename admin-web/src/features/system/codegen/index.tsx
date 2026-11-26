@@ -59,7 +59,8 @@ export function CodegenPage() {
     table: '',
     menuParent: 'menu_collab',
     sort: '50',
-    icon: 'Briefcase'
+    icon: 'Briefcase',
+    audit: true
   })
   const [fields, setFields] = useState<FieldDraft[]>(DEMO_FIELDS)
   const [preview, setPreview] = useState<CodegenPreview | null>(null)
@@ -396,6 +397,18 @@ export function CodegenPage() {
                       ))}
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="space-y-1.5">
+                  <Label>列表页审计列</Label>
+                  <div className="flex items-center gap-2">
+                    <FlagChip
+                      label="展示"
+                      active={form.audit}
+                      title="生成创建人/更新人/创建时间/更新时间四列"
+                      onChange={value => setForm(current => ({ ...current, audit: value }))}
+                    />
+                    <span className="text-muted-foreground text-[11px]">创建人显示姓名（回退账号），需后端审计名转换拦截器</span>
+                  </div>
                 </div>
               </div>
 

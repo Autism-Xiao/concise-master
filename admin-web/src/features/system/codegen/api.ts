@@ -51,6 +51,8 @@ export interface CodegenSpecPayload {
   menuParent?: string
   sort?: number
   icon?: string
+  /** 是否在列表页展示审计列（创建人/更新人/创建时间/更新时间），默认 true */
+  audit?: boolean
   fields: CodegenFieldPayload[]
 }
 

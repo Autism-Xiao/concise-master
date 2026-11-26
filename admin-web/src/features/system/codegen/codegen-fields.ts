@@ -65,6 +65,7 @@ export function buildPayload(
     menuParent: string
     sort: string
     icon: string
+    audit: boolean
   },
   fields: FieldDraft[]
 ): { payload: CodegenSpecPayload | null; error?: string } {
@@ -108,6 +109,7 @@ export function buildPayload(
       menuParent: form.menuParent,
       sort: Number(form.sort) || 50,
       icon: form.icon,
+      audit: form.audit,
       fields: out
     }
   }

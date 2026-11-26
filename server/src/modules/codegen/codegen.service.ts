@@ -225,6 +225,9 @@ export class CodegenService {
       const overwritten = manifest?.overwritten ?? []
       const addedColumns = manifest?.addedColumns ?? []
       const warnings: string[] = []
+      if (dto.owner === false) {
+        warnings.push('本模块无归属列（owner=false）：不生成 create_by，行权限只应用显式数据规则；未配规则时租户内全部可见（角色 data_scope 不生效），可用 /v1/grants + /v1/data-rules 配置')
+      }
       if (tableExists && addedColumns.length === 0) {
         warnings.push(`数据表 ${tableName} 已存在且字段都对得上：本次没有补列，表结构不变`)
       }
@@ -344,6 +347,8 @@ export class CodegenService {
       menuParent: dto.menuParent ?? 'menu_collab',
       sort: dto.sort ?? 50,
       icon: dto.icon ?? 'Briefcase',
+      owner: dto.owner !== false,
+      audit: dto.audit !== false,
       adminRoot: this.adminRoot,
       existingColumns,
       fields: dto.fields.map(field => ({
@@ -377,6 +382,9 @@ export class CodegenService {
     const list: string[] = []
     const table = dto.table ?? dto.module
     const tableExists = existingColumns.length > 0
+    if (dto.owner === false) {
+      list.push('本模块无归属列（owner=false）：不生成 create_by，行权限只应用显式数据规则；未配规则时租户内全部可见（角色 data_scope 不生效），可用 /v1/grants + /v1/data-rules 配置')
+    }
     if (existsSync(path.join(this.serverRoot, 'src', 'modules', dto.module))) {
       list.push(`后端已有 src/modules/${dto.module}：确认生成时同名文件会先备份到 .codegen-backup/ 再覆盖`)
     }

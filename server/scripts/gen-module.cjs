@@ -14,6 +14,9 @@
  *     选项：r=必填  u=唯一  q=列表查询过滤  s=keyword 模糊搜索
  *           default=N=默认值  e=v:标签|v:标签（enum 专用，值与标签用冒号、项用竖线，标签里别用冒号）
  *
+ *   --no-owner：无归属列表（如供应商：表里没有 create_by）。这类模块只应用显式数据规则，
+ *     不回退角色 data_scope（无 create_by 可比对）；没配规则时 = 租户内全部可见。
+ *
  * 产物：
  *   后端 src/modules/<module>/   entity + dto + service + v1.controller + module
  *        src/migrations/<ts>-Gen<Module>.ts（含菜单节点，带 scope 列）
@@ -64,6 +67,19 @@ function usageAndExit() {
  */
 const specPath = argOf('--spec')
 const spec = specPath ? JSON.parse(fs.readFileSync(path.resolve(specPath), 'utf8')) : {}
+
+/**
+ * --no-owner：无归属列模块（表没有 create_by）。生成的 service 只应用显式数据规则，
+ * 不回退 owner scope；无规则 = 租户内全可见。与 supplier 现状一致。
+ * 可通过 spec.owner=false 指定（页面表单暂未暴露此开关）。
+ */
+const NO_OWNER = args.includes('--no-owner') || spec.owner === false
+
+/**
+ * --no-audit：不在生成的列表页展示审计列（创建人/更新人/创建时间/更新时间）。
+ * 默认展示（audit !== false）。后端 createBy/updateBy 仍照常落库，只是列表不显示。
+ */
+const SHOW_AUDIT = !args.includes('--no-audit') && spec.audit !== false && spec.showAudit !== false
 
 const moduleSnake = spec.module ?? argOf('--module')
 const label = spec.label ?? argOf('--label', moduleSnake)
@@ -340,7 +356,7 @@ export class ${ModulePascal}Entity {
 
 ${entityColumns}
 
-  @ApiPropertyOptional({ description: '创建人（用户名/账号）', nullable: true })
+${NO_OWNER ? '' : `  @ApiPropertyOptional({ description: '创建人（用户名/账号）', nullable: true })
   @Column({ type: 'varchar', length: 32, nullable: true, comment: '创建人' })
   createBy?: string | null
 
@@ -348,7 +364,7 @@ ${entityColumns}
   @Column({ type: 'varchar', length: 32, nullable: true, comment: '更新人' })
   updateBy?: string | null
 
-  @ApiPropertyOptional({ description: '删除标记：0 正常 / 1 已删除' })
+`}  @ApiPropertyOptional({ description: '删除标记：0 正常 / 1 已删除' })
   @Column({ type: 'tinyint', default: 0, comment: '0正常 1已删除' })
   delFlag: number
 
@@ -479,13 +495,15 @@ writeIfAbsent(
   serviceFile,
   `import { BadRequestException, Injectable } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
+import { Repository, type ObjectLiteral, type SelectQueryBuilder } from 'typeorm'
 
 import { isDuplicateEntryError } from '../../utils/db-error.util'
 import { BaseService } from '../../helper/crud/base.service'
 import { applySort, paginate, type Pagination } from '../../helper/paginate'
-import { TenantContext } from '../../shared/tenant/tenant.context'
-import { applyTenantScope } from '../../shared/tenant/tenant-scope.util'
+${NO_OWNER ? '' : "import { TenantContext } from '../../shared/tenant/tenant.context'\n"}import { applyTenantScope } from '../../shared/tenant/tenant-scope.util'
+import type { DataAction } from '../../shared/permission/data-policy.util'
+${NO_OWNER ? "import { applyPolicyScope } from '../../shared/permission/data-policy.util'\nimport type { OwnerScopeActor } from '../../shared/permission/owner-scope.util'" : "import { applyResourceScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'"}
+import { GrantService } from '../system/grant/grant.service'
 import { Create${ModulePascal}Dto, List${ModulePascal}Dto, Update${ModulePascal}Dto } from './dto/${moduleSnake}.dto'
 import { ${ModulePascal}Entity } from './entities/${moduleSnake}.entity'
 
@@ -502,9 +520,33 @@ ${uniqueLabelMap}
 
   constructor(
     @InjectRepository(${ModulePascal}Entity)
-    repository: Repository<${ModulePascal}Entity>
+    repository: Repository<${ModulePascal}Entity>,
+    private readonly grantService: GrantService
   ) {
     super(repository, '${label}')
+  }
+
+  /** 可被数据规则引用的字段白名单：直接取实体元数据，字段改名/新增不会漏配 */
+  private get policyFields(): string[] {
+    return this.repository.metadata.columns.map(column => column.propertyName)
+  }
+
+  /**
+   * 行级范围：优先显式数据规则（sys_data_rule），${NO_OWNER ? '本表无归属列，不回退 owner scope；无规则时租户内全部可见' : '无规则时回退角色 data_scope'}。
+   * 列表 / 详情 / 增改删校验共用这一套条件，由基类按 action 分别解析 read / write / delete 规则。
+   */
+  protected override async applyRowScope<Q extends ObjectLiteral>(
+    qb: SelectQueryBuilder<Q>,
+    alias: string,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy',
+    action: DataAction = 'read'
+  ): Promise<void> {
+    if (!actor) return
+    if (Number(actor.isPlatformAdmin ?? 0) === 1) return
+    const rules = await this.grantService.getRulesForUser(actor, '${moduleSnake}', action)
+${NO_OWNER ? `    const deptIds = String(actor.departIds ?? '').split(',').map(value => value.trim()).filter(Boolean)
+    applyPolicyScope(qb, alias, rules, { id: actor.id, deptIds }, this.policyFields, ownerColumn)` : `    applyResourceScope(qb, alias, rules, actor, this.policyFields, ownerColumn)`}
   }
 
   /** 唯一键查重：excludeId 供更新时排除自身；按租户作用域查（唯一键也是 (tenant_id, 字段)） */
@@ -526,11 +568,12 @@ ${uniqueLabelMap}
     }
   }
 
-  /** 分页列表：keyword（模糊）${parsedFields.some(field => field.search) ? '' : '（未配置 s 字段时搜索恒空）'}${parsedFields.some(field => field.query) ? ' + 精确过滤' : ''} + 白名单排序 */
-  async listByQuery(query: List${ModulePascal}Dto): Promise<Pagination<${ModulePascal}Entity>> {
+  /** 分页列表：keyword（模糊）${parsedFields.some(field => field.search) ? '' : '（未配置 s 字段时搜索恒空）'}${parsedFields.some(field => field.query) ? ' + 精确过滤' : ''} + 白名单排序 + 行级范围 */
+  async listByQuery(query: List${ModulePascal}Dto, actor?: OwnerScopeActor | null): Promise<Pagination<${ModulePascal}Entity>> {
     const qb = this.repository.createQueryBuilder('${moduleCamel}').orderBy('${moduleCamel}.id', 'DESC')
     applyTenantScope(qb, '${moduleCamel}')
     qb.andWhere('${moduleCamel}.delFlag = 0')
+    await this.applyRowScope(qb, '${moduleCamel}', actor)
     applySort(qb, '${moduleCamel}', query, ${ModulePascal}SORTABLE)
     if (query.keyword) {
 ${searchConds || "      qb.andWhere('1 = 0') // 未配置 s 字段"}
@@ -539,11 +582,21 @@ ${queryConds}
     return paginate(qb, { page: query.page, pageSize: query.pageSize })
   }
 
-  /** 新增：唯一键查重 + 落 createBy；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
+  /** 详情：与列表共用行级范围，列表看不见的行按 id 也读不到 */
+  async findOneScoped(
+    id: number,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy',
+    action: DataAction = 'read'
+  ): Promise<${ModulePascal}Entity> {
+    return super.findOneScoped(id, actor, ownerColumn, action)
+  }
+
+  /** 新增：唯一键查重${NO_OWNER ? '' : ' + 落 createBy'}；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
   async create(dto: Create${ModulePascal}Dto): Promise<${ModulePascal}Entity> {
     await this.assertAllUnique(dto)
     try {
-      return await super.create({ ...dto, createBy: TenantContext.userId() })
+      return await super.create(${NO_OWNER ? 'dto' : '{ ...dto, createBy: TenantContext.userId() }'})
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('${label}与已有数据冲突（唯一约束），请检查${uniqueFields.map(field => field.comment).join('、') || '唯一字段'}是否重复')
@@ -552,12 +605,11 @@ ${queryConds}
     }
   }
 
-  /** 修改：唯一键查重（排除自身）+ 落 updateBy */
-  async update(id: number, dto: Update${ModulePascal}Dto): Promise<${ModulePascal}Entity> {
-    await this.findOne(id)
+  /** 修改：唯一键查重（排除自身）${NO_OWNER ? '' : ' + 落 updateBy'} + 按 write 规则校验行权限 */
+  async update(id: number, dto: Update${ModulePascal}Dto, actor?: OwnerScopeActor | null): Promise<${ModulePascal}Entity> {
     await this.assertAllUnique(dto, id)
     try {
-      return await super.update(id, { ...dto, updateBy: TenantContext.userId() })
+      return await super.updateScoped(id, ${NO_OWNER ? 'dto' : '{ ...dto, updateBy: TenantContext.userId() }'}, actor)
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('${label}与已有数据冲突（唯一约束），请检查${uniqueFields.map(field => field.comment).join('、') || '唯一字段'}是否重复')
@@ -566,10 +618,9 @@ ${queryConds}
     }
   }
 
-  /** 软删除：del_flag 置 1；软删行仍占用唯一键，与查重「含软删占用」配套 */
-  async delete(id: number): Promise<void> {
-    const entity = await this.findOne(id)
-    await this.repository.update(entity.id, { delFlag: 1 })
+  /** 软删除：按 delete 规则校验行权限后 del_flag 置 1；软删行仍占用唯一键 */
+  async delete(id: number, actor?: OwnerScopeActor | null): Promise<void> {
+    await this.softDeleteScoped(id, { delFlag: 1 }, actor)
   }
 }
 `
@@ -579,15 +630,21 @@ ${queryConds}
 const controllerFile = path.join(serverRoot, `src/modules/${moduleSnake}/${moduleSnake}.v1.controller.ts`)
 writeIfAbsent(
   controllerFile,
-  `import { Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Put, Query } from '@nestjs/common'
+  `import { Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Put, Query, Request } from '@nestjs/common'
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger'
 
 import { OperLog } from '../../common/decorators/oper-log.decorator'
 import { Perms } from '../../common/decorators/perms.decorator'
+import type { OwnerScopeActor } from '../../shared/permission/owner-scope.util'
 import { Create${ModulePascal}Dto, List${ModulePascal}Dto, Update${ModulePascal}Dto } from './dto/${moduleSnake}.dto'
 import { ${ModulePascal}Service } from './${moduleSnake}.service'
 
-/** ${label} v1 接口：统一挂 /api/v1，按钮权限 ${permsPrefix}:* */
+/** 行级范围所需的最小 actor 结构（jwt.strategy 挂到 req.user 的 UserEntity 满足它） */
+interface OwnerRequest {
+  user: OwnerScopeActor
+}
+
+/** ${label} v1 接口：统一挂 /api/v1，按钮权限 ${permsPrefix}:*；数据范围走请求用户上下文 */
 @ApiTags('${label}')
 @ApiBearerAuth('jwt')
 @Controller('v1/${moduleSnake}s')
@@ -597,15 +654,15 @@ export class ${ModulePascal}V1Controller {
   @ApiOperation({ summary: '${label}分页', description: '需 ${permsPrefix}:list' })
   @Perms('${permsPrefix}:list')
   @Get()
-  list(@Query() query: List${ModulePascal}Dto) {
-    return this.${moduleCamel}Service.listByQuery(query)
+  list(@Query() query: List${ModulePascal}Dto, @Request() req: OwnerRequest) {
+    return this.${moduleCamel}Service.listByQuery(query, req.user)
   }
 
   @ApiOperation({ summary: '${label}详情', description: '需 ${permsPrefix}:list' })
   @Perms('${permsPrefix}:list')
   @Get(':id')
-  findOne(@Param('id', ParseIntPipe) id: number) {
-    return this.${moduleCamel}Service.findOne(id)
+  findOne(@Param('id', ParseIntPipe) id: number, @Request() req: OwnerRequest) {
+    return this.${moduleCamel}Service.findOneScoped(id, req.user)
   }
 
   @ApiOperation({ summary: '新增${label}', description: '需 ${permsPrefix}:add' })
@@ -620,16 +677,16 @@ export class ${ModulePascal}V1Controller {
   @Perms('${permsPrefix}:update')
   @OperLog('${label}')
   @Put(':id')
-  update(@Param('id', ParseIntPipe) id: number, @Body() dto: Update${ModulePascal}Dto) {
-    return this.${moduleCamel}Service.update(id, dto)
+  update(@Param('id', ParseIntPipe) id: number, @Body() dto: Update${ModulePascal}Dto, @Request() req: OwnerRequest) {
+    return this.${moduleCamel}Service.update(id, dto, req.user)
   }
 
   @ApiOperation({ summary: '删除${label}', description: '需 ${permsPrefix}:delete' })
   @Perms('${permsPrefix}:delete')
   @OperLog('${label}')
   @Delete(':id')
-  remove(@Param('id', ParseIntPipe) id: number) {
-    return this.${moduleCamel}Service.delete(id)
+  remove(@Param('id', ParseIntPipe) id: number, @Request() req: OwnerRequest) {
+    return this.${moduleCamel}Service.delete(id, req.user)
   }
 }
 `
@@ -674,8 +731,7 @@ const migrationColumns = [
           : ' DEFAULT NULL'
     return `\`${field.name}\` ${typeMap.mysql}${field.required ? ' NOT NULL' : ' NULL'}${defaultSql} COMMENT '${comment}'`
   }),
-  '`create_by` varchar(32) NULL COMMENT \'创建人\'',
-  '`update_by` varchar(32) NULL COMMENT \'更新人\'',
+  ...(NO_OWNER ? [] : ['`create_by` varchar(32) NULL COMMENT \'创建人\'', '`update_by` varchar(32) NULL COMMENT \'更新人\'']),
   '`del_flag` tinyint NOT NULL DEFAULT 0 COMMENT \'0正常 1已删除\'',
   '`created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)',
   '`updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)'
@@ -812,13 +868,16 @@ writeIfAbsent(
 export interface ${ModulePascal} {
   id: number
 ${feApiFields}
-  createBy?: string | null
+${NO_OWNER ? '' : `  createBy?: string | null
   updateBy?: string | null
-  createdAt: string
+  /** 后端响应层把 createBy/updateBy 的 ID 翻译成的展示名（姓名优先，回退账号）；查不到对应用户时无此字段 */
+  createByName?: string
+  updateByName?: string
+`}  createdAt: string
   updatedAt: string
 }
 
-export type ${ModulePascal}WritePayload = Partial<Omit<${ModulePascal}, 'id' | 'createBy' | 'updateBy' | 'createdAt' | 'updatedAt'>>
+export type ${ModulePascal}WritePayload = Partial<Omit<${ModulePascal}, 'id' | ${NO_OWNER ? '' : "'createBy' | 'updateBy' | 'createByName' | 'updateByName' | "}'createdAt' | 'updatedAt'>>
 
 /** 列表查询参数：分页/排序与后端 PagerDto 对齐，业务过滤项（query 字段）可选追加 */
 export interface ${ModulePascal}ListParams {
@@ -895,6 +954,52 @@ const feColumns = feFields
       }`
   )
   .join(',\n')
+
+/**
+ * 审计字段列：两列合并样式（与现有页面一致）
+ *   - 有归属列：一列「创建人 / 更新人」（两行：建 X / 更 Y），一列「创建 / 更新时间」（两行）
+ *   - 无归属列（owner=false）：只生成「创建 / 更新时间」一列
+ * SHOW_AUDIT=false（--no-audit / spec.audit=false）时整组不生成；列显隐仍可按需关闭。
+ * 创建人/更新人优先显示后端翻译的 createByName/updateByName（姓名，回退账号），无则回退原 ID。
+ * 时间精确到分钟（slice(0,16)）。
+ */
+const auditColumnLabels = !SHOW_AUDIT
+  ? ''
+  : [
+      ...(NO_OWNER ? [] : ["  auditUser: '创建人 / 更新人'"]),
+      "  auditTime: '创建 / 更新时间'"
+    ].join(',\n')
+
+const auditColumns = !SHOW_AUDIT
+  ? ''
+  : [
+      ...(NO_OWNER
+        ? []
+        : [
+            `      {
+        id: 'auditUser',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="创建人 / 更新人" />,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <div className="space-y-0.5 whitespace-nowrap">
+            <div>建 {row.original.createByName || row.original.createBy || '-'}</div>
+            <div>更 {row.original.updateByName || row.original.updateBy || '-'}</div>
+          </div>
+        )
+      }`
+          ]),
+      `      {
+        id: 'auditTime',
+        header: ({ column }) => <DataTableColumnHeader column={column} title="创建 / 更新时间" />,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <div className="space-y-0.5 tabular-nums whitespace-nowrap">
+            <div>{String(row.original.createdAt ?? '').replace('T', ' ').slice(0, 16) || '-'}</div>
+            <div>{String(row.original.updatedAt ?? '').replace('T', ' ').slice(0, 16) || '-'}</div>
+          </div>
+        )
+      }`
+    ].join(',\n')
 
 const enumLabelConsts = feFields
   .filter(field => field.type === 'enum')
@@ -1057,7 +1162,7 @@ import {
 import { ${ModulePascal}FormDrawer } from './components/${moduleSnake}-form-drawer'
 
 ${enumLabelConsts ? enumLabelConsts + '\n\n' : ''}const columnLabels: Record<string, string> = {
-${feFields.map(field => `  ${field.tsName}: '${field.comment}'`).join(',\n')},
+${feFields.map(field => `  ${field.tsName}: '${field.comment}'`).join(',\n')}${auditColumnLabels ? `,\n${auditColumnLabels}` : ''},
   actions: '操作'
 }
 
@@ -1076,7 +1181,7 @@ export function ${ModulePascal}Page() {
 
   const columns = useMemo<ColumnDef<${ModulePascal}>[]>(
     () => [
-${feColumns},
+${feColumns}${auditColumns ? `,\n${auditColumns}` : ''},
       {
         id: 'actions',
         header: () => <div className="text-end">操作</div>,
