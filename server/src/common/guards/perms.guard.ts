@@ -3,6 +3,7 @@ import { Reflector } from '@nestjs/core'
 
 import { PERMS_KEY } from '../decorators/perms.decorator'
 import { PermissionCacheService } from '../../shared/permission-cache/permission-cache.service'
+import { GrantService } from '../../modules/system/grant/grant.service'
 import { TenantContext } from '../../shared/tenant/tenant.context'
 
 /**
@@ -24,7 +25,8 @@ import { TenantContext } from '../../shared/tenant/tenant.context'
 export class PermsGuard implements CanActivate {
   constructor(
     private readonly reflector: Reflector,
-    private readonly permissionCache: PermissionCacheService
+    private readonly permissionCache: PermissionCacheService,
+    private readonly grantService: GrantService
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -62,6 +64,20 @@ export class PermsGuard implements CanActivate {
     const roleIds = roles.map((role: { id: string }) => role.id)
     // 走缓存：角色 → sys_role_permission → sys_permission.perms（无效/已删除菜单不算数）
     const owned = await this.permissionCache.getRolesPerms(roleIds)
+
+    // 例外授权（sys_grant）：用户直授 ∪ 部门 ∪ 岗位 ∪ 角色授权，与角色权限取并集。
+    // 这是「角色爆炸」的解法：跨部门临时授权挂一条授权行，不用新建角色。
+    // GrantService 内部有 30s 进程缓存，写路径主动清空，降权最迟 30s 生效。
+    const subject = await this.grantService.resolveSubject({
+      id: user.id,
+      departIds: (user as { departIds?: string | null }).departIds,
+      roles
+    })
+    const grantedPerms = await this.grantService.getGrantedPerms(subject, TenantContext.filterTenantId())
+    for (const perm of grantedPerms) {
+      owned.add(perm)
+    }
+
     // 租户套餐是接口级上限：角色授权 ∩ 套餐授权。只在前端隐藏菜单不够——
     // 收窄/清空套餐后，旧 token 仍能直接调被收回模块的接口。
     const tenantId = TenantContext.filterTenantId()

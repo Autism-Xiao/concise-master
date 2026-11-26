@@ -1,13 +1,14 @@
 import { BadRequestException, Injectable } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
+import { Repository, type ObjectLiteral, type SelectQueryBuilder } from 'typeorm'
 
 import { isDuplicateEntryError } from '../../utils/db-error.util'
 import { BaseService } from '../../helper/crud/base.service'
 import { applySort, paginate, type Pagination } from '../../helper/paginate'
 import { TenantContext } from '../../shared/tenant/tenant.context'
 import { createTenantQb } from '../../shared/tenant/tenant-qb.factory'
-import { applyOwnerScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
+import { applyResourceScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
+import { GrantService } from '../system/grant/grant.service'
 import { CreateCustomerDto, ListCustomerDto, UpdateCustomerDto } from './dto/customer.dto'
 import { CustomerEntity } from './entities/customer.entity'
 
@@ -32,9 +33,26 @@ export class CustomerService extends BaseService<CustomerEntity> {
 
   constructor(
     @InjectRepository(CustomerEntity)
-    repository: Repository<CustomerEntity>
+    repository: Repository<CustomerEntity>,
+    private readonly grantService: GrantService
   ) {
     super(repository, '客户')
+  }
+
+  /** 可被数据规则引用的字段白名单：直接取实体元数据，字段改名/新增不会漏配 */
+  private get policyFields(): string[] {
+    return this.repository.metadata.columns.map(column => column.propertyName)
+  }
+
+  /** 行级范围：优先数据规则，无规则时回退角色 data_scope；列表与详情共用 */
+  protected override async applyRowScope<Q extends ObjectLiteral>(
+    qb: SelectQueryBuilder<Q>,
+    alias: string,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy'
+  ): Promise<void> {
+    const rules = actor ? await this.grantService.getRulesForUser(actor, 'customer') : []
+    applyResourceScope(qb, alias, rules, actor, this.policyFields, ownerColumn)
   }
 
   /** 唯一键查重：excludeId 供更新时排除自身；按租户作用域查（唯一键也是 (tenant_id, 字段)） */
@@ -55,11 +73,11 @@ export class CustomerService extends BaseService<CustomerEntity> {
     }
   }
 
-  /** 分页列表：keyword（模糊）；角色 data_scope=仅本人时按 createBy 收窄 */
+  /** 分页列表：keyword（模糊）；数据范围优先走数据规则，无规则时回退角色 data_scope */
   async listByQuery(query: ListCustomerDto, actor?: OwnerScopeActor | null): Promise<Pagination<CustomerEntity>> {
     const qb = createTenantQb(this.repository, 'customer').orderBy('customer.id', 'DESC')
     qb.andWhere('customer.delFlag = 0')
-    applyOwnerScope(qb, 'customer', actor)
+    await this.applyRowScope(qb, 'customer', actor)
     applySort(qb, 'customer', query, CUSTOMER_SORTABLE)
     if (query.keyword) {
       qb.andWhere('customer.name LIKE :keyword', { keyword: `%${query.keyword}%` })

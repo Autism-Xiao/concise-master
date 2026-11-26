@@ -23,6 +23,7 @@ import { DatabaseModule } from './shared/database/database.module'
 import { RateLimitModule } from './shared/rate-limit/rate-limit.module'
 import { PermissionCacheModule } from './shared/permission-cache/permission-cache.module'
 import { AuthCacheModule } from './shared/auth-cache/auth-cache.module'
+import { GrantModule } from './modules/system/grant/grant.module'
 import { UserModule } from './modules/user/user.module'
 import { AuthModule } from './modules/auth/auth.module'
 import { RoleModule } from './modules/role/role.module'
@@ -86,6 +87,8 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule()
     PermissionCacheModule,
     // 鉴权用户短缓存（JwtStrategy 读、账号写路径主动失效），全局模块
     AuthCacheModule,
+    // 例外授权与数据规则（窄口径 ABAC：主体授权行 + 规则翻译成 SQL），全局模块
+    GrantModule,
     // 租户资源配额（sys_config 驱动的 Seats / Storage 上限），全局模块
     QuotaModule,
     // 租户级特性开关（sys_config feature.* 键，@FeatureFlag + FeatureGuard），全局模块

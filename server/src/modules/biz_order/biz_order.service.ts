@@ -1,13 +1,14 @@
 import { BadRequestException, Injectable } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
+import { Repository, type ObjectLiteral, type SelectQueryBuilder } from 'typeorm'
 
 import { isDuplicateEntryError } from '../../utils/db-error.util'
 import { BaseService } from '../../helper/crud/base.service'
 import { applySort, paginate, type Pagination } from '../../helper/paginate'
 import { TenantContext } from '../../shared/tenant/tenant.context'
 import { createTenantQb } from '../../shared/tenant/tenant-qb.factory'
-import { applyOwnerScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
+import { applyResourceScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
+import { GrantService } from '../system/grant/grant.service'
 import { CreateBizOrderDto, ListBizOrderDto, UpdateBizOrderDto } from './dto/biz_order.dto'
 import { BizOrderEntity } from './entities/biz_order.entity'
 
@@ -31,7 +32,8 @@ export class BizOrderService extends BaseService<BizOrderEntity> {
 
   constructor(
     @InjectRepository(BizOrderEntity)
-    repository: Repository<BizOrderEntity>
+    repository: Repository<BizOrderEntity>,
+    private readonly grantService: GrantService
   ) {
     super(repository, '订单')
   }
@@ -54,11 +56,32 @@ export class BizOrderService extends BaseService<BizOrderEntity> {
     }
   }
 
-  /** 分页列表：keyword（模糊） + 精确过滤；角色 data_scope=仅本人时按 createBy 收窄 */
+  /** 可被数据规则引用的字段白名单：直接取实体元数据，字段改名/新增不会漏配 */
+  private get policyFields(): string[] {
+    return this.repository.metadata.columns.map(column => column.propertyName)
+  }
+
+  /**
+   * 行级范围：优先数据规则（可表达「订单全部可见」），无规则时回退角色 data_scope。
+   * 列表与详情共用这一处，保证「列表看得见 = 详情进得去」。
+   */
+  protected override async applyRowScope<Q extends ObjectLiteral>(
+    qb: SelectQueryBuilder<Q>,
+    alias: string,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy'
+  ): Promise<void> {
+    const rules = actor ? await this.grantService.getRulesForUser(actor, 'biz_order') : []
+    applyResourceScope(qb, alias, rules, actor, this.policyFields, ownerColumn)
+  }
+
+  /** 分页列表：keyword（模糊） + 精确过滤；数据范围优先走数据规则，无规则时回退角色 data_scope */
   async listByQuery(query: ListBizOrderDto, actor?: OwnerScopeActor | null): Promise<Pagination<BizOrderEntity>> {
     const qb = createTenantQb(this.repository, 'bizOrder').orderBy('bizOrder.id', 'DESC')
     qb.andWhere('bizOrder.delFlag = 0')
-    applyOwnerScope(qb, 'bizOrder', actor)
+    // 规则命中时按规则过滤（支持「订单看全部」这类角色级 data_scope 表达不了的范围）；
+    // 没命中则 applyResourceScope 内部回退 applyOwnerScope，存量行为不变
+    await this.applyRowScope(qb, 'bizOrder', actor)
     applySort(qb, 'bizOrder', query, BIZ_ORDER_SORTABLE)
     if (query.keyword) {
       qb.andWhere('bizOrder.title LIKE :keyword', { keyword: `%${query.keyword}%` })

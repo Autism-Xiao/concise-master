@@ -1,10 +1,21 @@
-import { Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Put, Query } from '@nestjs/common'
+import { Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Put, Query, Request } from '@nestjs/common'
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger'
 
 import { OperLog } from '../../common/decorators/oper-log.decorator'
 import { Perms } from '../../common/decorators/perms.decorator'
 import { CreateSupplierDto, UpdateSupplierDto } from './dto/supplier.dto'
 import { SupplierService } from './supplier.service'
+
+/** 行级范围需要的用户上下文（jwt.strategy 挂到 req.user 的 UserEntity 子集） */
+interface OwnerRequest {
+  user?: {
+    id: string
+    isPlatformAdmin?: number
+    departIds?: string | null
+    roles?: Array<{ dataScope?: number | null }> | null
+    superviseDeptIds?: string[] | null
+  }
+}
 
 /** 供应商 v1 接口：统一挂 /api/v1，按钮权限 supplier:* */
 @ApiTags('供应商')
@@ -13,11 +24,11 @@ import { SupplierService } from './supplier.service'
 export class SupplierV1Controller {
   constructor(private readonly supplierService: SupplierService) {}
 
-  @ApiOperation({ summary: '供应商分页', description: '需 supplier:list' })
+  @ApiOperation({ summary: '供应商分页', description: '需 supplier:list；配了数据规则时按规则收窄' })
   @Perms('supplier:list')
   @Get()
-  list(@Query() query: { page?: number; pageSize?: number; keyword?: string }) {
-    return this.supplierService.listByQuery(query)
+  list(@Query() query: { page?: number; pageSize?: number; keyword?: string }, @Request() req: OwnerRequest) {
+    return this.supplierService.listByQuery(query, req.user)
   }
 
   @ApiOperation({ summary: '供应商详情', description: '需 supplier:list' })

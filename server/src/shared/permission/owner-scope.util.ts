@@ -1,5 +1,7 @@
 import type { ObjectLiteral, SelectQueryBuilder } from 'typeorm'
 
+import { applyPolicyScope, type ResolvedRule } from './data-policy.util'
+
 /**
  * 业务数据的「用户级行权限」（owner scope）
  *
@@ -29,7 +31,9 @@ import type { ObjectLiteral, SelectQueryBuilder } from 'typeorm'
 export interface OwnerScopeActor {
   id: string
   isPlatformAdmin?: number
-  roles?: Array<{ dataScope?: number | null }> | null
+  roles?: Array<{ id?: string; dataScope?: number | null }> | null
+  /** 用户所属部门（sys_user.depart_ids，逗号分隔）；数据规则里的 $user.deptIds 会用到 */
+  departIds?: string | null
   /** 该用户被授权监管的部门 id（**已含子孙，配置时展开**）；只有部门档(2/3)会用 */
   superviseDeptIds?: string[] | null
 }
@@ -85,4 +89,40 @@ export function applyOwnerScope<T extends ObjectLiteral>(
   }
 
   qb.andWhere(`${alias}.${ownerColumn} = :__ownerScopeId`, { __ownerScopeId: current.id })
+}
+
+/**
+ * 资源级数据范围（新入口，业务查询统一走这里）
+ *
+ * 优先级：
+ * 1. 平台管理员 → 不过滤；
+ * 2. 命中数据规则（sys_data_rule）→ 用规则生成条件，不再看角色 data_scope；
+ * 3. 没有规则 → 回退 applyOwnerScope（存量行为完全不变，可灰度迁移）。
+ *
+ * 为什么规则优先：规则是「授权行 + 资源」维度的，天然支持
+ * 「订单看全部、客户只看自己」；data_scope 是角色级的，做不到这一点。
+ *
+ * @param rules         该 actor 在 resource 上命中的规则（GrantService.getRulesForUser）
+ * @param allowedFields 该资源允许被规则引用的实体列名（白名单，防 SQL 注入）
+ */
+export function applyResourceScope<T extends ObjectLiteral>(
+  qb: SelectQueryBuilder<T>,
+  alias: string,
+  rules: ResolvedRule[] | null | undefined,
+  actor: OwnerScopeActor | null | undefined,
+  allowedFields: string[],
+  ownerColumn = 'createBy'
+): void {
+  if (!actor) return
+  if (Number(actor.isPlatformAdmin ?? 0) === 1) return
+
+  const deptIds = String(actor.departIds ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean)
+
+  const applied = applyPolicyScope(qb, alias, rules, { id: actor.id, deptIds }, allowedFields, ownerColumn)
+  if (applied) return
+
+  applyOwnerScope(qb, alias, actor, ownerColumn)
 }

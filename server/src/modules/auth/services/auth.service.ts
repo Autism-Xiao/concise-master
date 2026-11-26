@@ -19,6 +19,7 @@ import { LogService } from '../../system/log/log.service'
 import { MenuService, buildMenuTree, type MenuTreeItem } from '../../menu/menu.service'
 import { OnlineService } from '../../ops/online/online.service'
 import { SystemConfigService } from '../../system/config/system-config.service'
+import { GrantService } from '../../system/grant/grant.service'
 import type { MenuEntity } from '../../menu/entities/menu.entity'
 import { CaptchaService } from './captcha.service'
 import { TotpService } from './totp.service'
@@ -165,7 +166,9 @@ export class AuthService {
     // 备份码兜底校验：TOTP 不通过时允许用一次性备份码登录
     private readonly totpService: TotpService,
     // 强制 2FA 策略开关（security.platformAdmin.require2fa）走系统参数，默认关闭
-    private readonly systemConfig: SystemConfigService
+    private readonly systemConfig: SystemConfigService,
+    // 例外授权（sys_grant）：登录后汇总权限时要与角色权限合并，来源与 PermsGuard 一致
+    private readonly grantService: GrantService
   ) {}
 
   /**
@@ -342,6 +345,16 @@ export class AuthService {
       for (const perm of role.permissions ?? []) {
         allowedIds.add(perm.id)
       }
+    }
+
+    // 例外授权（sys_grant）：授权行的权限点同样参与菜单树与权限码计算。
+    // 与角色授权并集，前端不需要感知来源 —— 小王被直授「订单查看」后，
+    // 侧边栏出现订单管理菜单、按钮不出现，全部由这一处 allowedIds 驱动。
+    const subject = await this.grantService.resolveSubject(user)
+    const grants = await this.grantService.loadGrants(subject, currentTenant)
+    for (const grant of grants) {
+      if (grant.ruleEffect === 'deny') continue
+      allowedIds.add(grant.permissionId)
     }
 
     // 权限码：菜单节点（决定能否进页面/调列表接口）与按钮节点（决定能否增删改）都算；

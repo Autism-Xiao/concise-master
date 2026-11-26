@@ -54,13 +54,29 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
   async findOneScoped(id: number | string, actor?: OwnerScopeActor | null, ownerColumn = 'createBy'): Promise<T> {
     const qb = this.repository.createQueryBuilder('entity')
     this.applyTenantToQuery(qb, 'entity')
-    applyOwnerScope(qb, 'entity', actor, ownerColumn)
+    await this.applyRowScope(qb, 'entity', actor, ownerColumn)
     qb.andWhere('entity.id = :id', { id })
     const entity = await qb.getOne()
     if (!entity) {
       throw new NotFoundException(`${this.entityName}不存在`)
     }
     return entity
+  }
+
+  /**
+   * 行级范围钩子（可覆写）
+   *
+   * 默认沿用 owner scope（角色 data_scope）；业务 service 覆写后可以接入数据规则，
+   * 让「列表」与「详情」走完全同一套条件 —— 否则会出现列表看得见、点详情 404 的不一致。
+   * 声明为 async 是为了让覆写方可以查规则（sys_data_rule）。
+   */
+  protected async applyRowScope<Q extends ObjectLiteral>(
+    qb: SelectQueryBuilder<Q>,
+    alias: string,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy'
+  ): Promise<void> {
+    applyOwnerScope(qb, alias, actor, ownerColumn)
   }
 
   /** 创建：字符串主键自动生成 32 位 id（数字自增主键不干预）；实体有 createTime 列且未显式传入时自动补当前时间 */
