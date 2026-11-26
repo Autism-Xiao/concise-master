@@ -154,7 +154,8 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
         realname: [required('姓名'), maxLength(100, '姓名')],
         password: user ? [optional(minLength(6, '密码'), maxLength(64, '密码'))] : [requiredWith('密码', minLength(6, '密码'), maxLength(64, '密码'))],
         phone: [optional(phone)],
-        email: [optional(email)]
+        email: [optional(email)],
+        roleIds: [required('角色')]
       },
       form
     )
@@ -306,7 +307,9 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
         ) : (
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label>角色（多选）</Label>
+              <Label>
+                角色（多选） <span className="text-destructive">*</span>
+              </Label>
               <CheckList
                 options={roles.map(r => {
                   // 岗位模板带入的角色锁死：勾选状态由岗位决定，取消要去岗位管理改模板或调整用户岗位
@@ -320,6 +323,7 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
                 selected={form.roleIds}
                 onToggle={id => toggle('roleIds', id)}
               />
+              <FieldError message={errors.roleIds} />
               <p className="text-muted-foreground text-xs">标注「岗位带入」的角色来自岗位默认角色模板，不可在此取消。</p>
             </div>
             <div className="space-y-2">

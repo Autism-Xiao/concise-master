@@ -63,11 +63,11 @@ export class CreateUserDto {
   @IsIn([1, 2])
   status?: number
 
-  @ApiPropertyOptional({ description: '角色 ID 列表（sys_role.id，32 位字符串）', example: ['f6817f48af4fb3af11b9e8bf182f618b'], type: [String] })
+  @ApiPropertyOptional({ description: '角色 ID 列表（sys_role.id，32 位字符串）；传了就必须至少 1 个', example: ['f6817f48af4fb3af11b9e8bf182f618b'], type: [String] })
   @IsOptional()
-  @IsArray()
-  @ArrayMinSize(1)
-  @IsString({ each: true })
+  @IsArray({ message: '角色必须是数组' })
+  @ArrayMinSize(1, { message: '请至少选择 1 个角色' })
+  @IsString({ each: true, message: '每个角色 ID 必须是字符串' })
   roleIds?: string[]
 
   @ApiPropertyOptional({
