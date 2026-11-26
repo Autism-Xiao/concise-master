@@ -97,7 +97,41 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
     }
     this.stampTenant(entity)
     this.stampCreateIfMissing(entity)
+    this.stampAudit(entity, 'create')
     return this.repository.save(entity)
+  }
+
+  /**
+   * 审计四要素统一落库（create 落创建人、update 落更新人）
+   *
+   * 规则：**实体有对应列 + 调用方没显式传 + 上下文有登录用户**才补。
+   * - 显式传值优先：存量 service 里的 `createBy: operator` 等业务指定值不被覆盖；
+   * - 名字快照取 TenantContext.displayName（写请求时中间件实时查库写入），
+   *   这样用户改名后历史记录保持当时的名字，不被追溯修改；
+   * - 没有登录用户的场景（定时任务/脚本/公开接口）不写，避免落下无意义的值。
+   *
+   * 实体没这些列时（如 supplier 无 createBy、关联表）自然跳过，不生成无效字段。
+   */
+  private stampAudit(target: DeepPartial<T>, mode: 'create' | 'update'): void {
+    const userId = TenantContext.userId()
+    if (!userId) return
+    const record = target as Record<string, unknown>
+    const idField = mode === 'create' ? 'createBy' : 'updateBy'
+    const nameField = mode === 'create' ? 'createByName' : 'updateByName'
+    if (!this.hasProperty(idField)) return
+
+    const explicitId = record[idField]
+    if (explicitId === undefined) {
+      // 调用方没指定 → 落当前用户 ID + 名字快照（主流场景，覆盖生成器模块与业务模块）
+      record[idField] = userId
+    } else if (String(explicitId) !== String(userId)) {
+      // 显式指定的是别人（代操作/系统任务）→ 名字快照不能张冠李戴，留空交给拦截器回退查库
+      return
+    }
+    // explicitId 是当前用户（含刚补的）→ 补名字快照
+    if (this.hasProperty(nameField) && record[nameField] === undefined) {
+      record[nameField] = TenantContext.displayName() ?? undefined
+    }
   }
 
   /** 主键是否为字符串列（varchar/char）——用于决定是否自动生成 id */
@@ -179,7 +213,9 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
 
   private async performUpdate(id: number | string, dto: DeepPartial<T>, before: T): Promise<T> {
     const shouldStamp = this.hasProperty('updateTime') && (dto as Record<string, unknown>).updateTime === undefined
-    const payload = shouldStamp ? ({ ...dto, updateTime: new Date() } as DeepPartial<T>) : dto
+    const payload = shouldStamp ? ({ ...dto, updateTime: new Date() } as DeepPartial<T>) : { ...dto }
+    // 审计四要素：实体有 updateBy 列且调用方未显式传时，补当前用户 + 名字快照
+    this.stampAudit(payload, 'update')
     const qb = this.repository
       .createQueryBuilder()
       .update()

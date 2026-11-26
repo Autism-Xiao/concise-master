@@ -356,13 +356,21 @@ export class ${ModulePascal}Entity {
 
 ${entityColumns}
 
-${NO_OWNER ? '' : `  @ApiPropertyOptional({ description: '创建人（用户名/账号）', nullable: true })
+${NO_OWNER ? '' : `  @ApiPropertyOptional({ description: '创建人用户 ID', nullable: true })
   @Column({ type: 'varchar', length: 32, nullable: true, comment: '创建人' })
   createBy?: string | null
 
-  @ApiPropertyOptional({ description: '更新人', nullable: true })
+  @ApiPropertyOptional({ description: '创建人名字快照（写入时固化，改名不影响历史）', nullable: true })
+  @Column({ type: 'varchar', length: 64, nullable: true, comment: '创建人名字快照' })
+  createByName?: string | null
+
+  @ApiPropertyOptional({ description: '更新人用户 ID', nullable: true })
   @Column({ type: 'varchar', length: 32, nullable: true, comment: '更新人' })
   updateBy?: string | null
+
+  @ApiPropertyOptional({ description: '更新人名字快照（写入时固化，改名不影响历史）', nullable: true })
+  @Column({ type: 'varchar', length: 64, nullable: true, comment: '更新人名字快照' })
+  updateByName?: string | null
 
 `}  @ApiPropertyOptional({ description: '删除标记：0 正常 / 1 已删除' })
   @Column({ type: 'tinyint', default: 0, comment: '0正常 1已删除' })
@@ -500,7 +508,7 @@ import { Repository, type ObjectLiteral, type SelectQueryBuilder } from 'typeorm
 import { isDuplicateEntryError } from '../../utils/db-error.util'
 import { BaseService } from '../../helper/crud/base.service'
 import { applySort, paginate, type Pagination } from '../../helper/paginate'
-${NO_OWNER ? '' : "import { TenantContext } from '../../shared/tenant/tenant.context'\n"}import { applyTenantScope } from '../../shared/tenant/tenant-scope.util'
+import { applyTenantScope } from '../../shared/tenant/tenant-scope.util'
 import type { DataAction } from '../../shared/permission/data-policy.util'
 ${NO_OWNER ? "import { applyPolicyScope } from '../../shared/permission/data-policy.util'\nimport type { OwnerScopeActor } from '../../shared/permission/owner-scope.util'" : "import { applyResourceScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'"}
 import { GrantService } from '../system/grant/grant.service'
@@ -592,11 +600,11 @@ ${queryConds}
     return super.findOneScoped(id, actor, ownerColumn, action)
   }
 
-  /** 新增：唯一键查重${NO_OWNER ? '' : ' + 落 createBy'}；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
+  /** 新增：唯一键查重（审计四要素由 BaseService 统一落）；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
   async create(dto: Create${ModulePascal}Dto): Promise<${ModulePascal}Entity> {
     await this.assertAllUnique(dto)
     try {
-      return await super.create(${NO_OWNER ? 'dto' : '{ ...dto, createBy: TenantContext.userId() }'})
+      return await super.create(dto)
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('${label}与已有数据冲突（唯一约束），请检查${uniqueFields.map(field => field.comment).join('、') || '唯一字段'}是否重复')
@@ -605,11 +613,11 @@ ${queryConds}
     }
   }
 
-  /** 修改：唯一键查重（排除自身）${NO_OWNER ? '' : ' + 落 updateBy'} + 按 write 规则校验行权限 */
+  /** 修改：唯一键查重（排除自身）+ 按 write 规则校验行权限，审计四要素由 BaseService 统一落 */
   async update(id: number, dto: Update${ModulePascal}Dto, actor?: OwnerScopeActor | null): Promise<${ModulePascal}Entity> {
     await this.assertAllUnique(dto, id)
     try {
-      return await super.updateScoped(id, ${NO_OWNER ? 'dto' : '{ ...dto, updateBy: TenantContext.userId() }'}, actor)
+      return await super.updateScoped(id, dto, actor)
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('${label}与已有数据冲突（唯一约束），请检查${uniqueFields.map(field => field.comment).join('、') || '唯一字段'}是否重复')
@@ -731,7 +739,7 @@ const migrationColumns = [
           : ' DEFAULT NULL'
     return `\`${field.name}\` ${typeMap.mysql}${field.required ? ' NOT NULL' : ' NULL'}${defaultSql} COMMENT '${comment}'`
   }),
-  ...(NO_OWNER ? [] : ['`create_by` varchar(32) NULL COMMENT \'创建人\'', '`update_by` varchar(32) NULL COMMENT \'更新人\'']),
+  ...(NO_OWNER ? [] : ['`create_by` varchar(32) NULL COMMENT \'创建人\'', '`create_by_name` varchar(64) NULL COMMENT \'创建人名字快照\'', '`update_by` varchar(32) NULL COMMENT \'更新人\'', '`update_by_name` varchar(64) NULL COMMENT \'更新人名字快照\'']),
   '`del_flag` tinyint NOT NULL DEFAULT 0 COMMENT \'0正常 1已删除\'',
   '`created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)',
   '`updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)'
@@ -870,9 +878,9 @@ export interface ${ModulePascal} {
 ${feApiFields}
 ${NO_OWNER ? '' : `  createBy?: string | null
   updateBy?: string | null
-  /** 后端响应层把 createBy/updateBy 的 ID 翻译成的展示名（姓名优先，回退账号）；查不到对应用户时无此字段 */
-  createByName?: string
-  updateByName?: string
+  /** 审计人名字快照：写入时固化当时的名字，改名不影响历史；旧数据可能为空，由后端兜底补全 */
+  createByName?: string | null
+  updateByName?: string | null
 `}  createdAt: string
   updatedAt: string
 }

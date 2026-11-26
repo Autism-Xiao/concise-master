@@ -68,6 +68,29 @@ export class UserDictService {
     return result
   }
 
+  /**
+   * 实时解析名字（绕过缓存直查库），供**写入审计快照**时使用。
+   *
+   * 不能用 getNames：那个带 60 秒缓存，用户改名后立即新建记录会写入旧名字，
+   * 快照就失去意义。这里直查库并顺手刷新缓存，保证快照是操作当时的真实展示名。
+   */
+  async resolveName(id?: string | null): Promise<string | null> {
+    const clean = String(id ?? '').trim()
+    if (!clean) return null
+    try {
+      const user = await this.userRepository.findOne({
+        where: { id: clean },
+        select: { id: true, username: true, realname: true }
+      })
+      const name = user?.realname?.trim() || user?.username || null
+      this.cache.set(clean, { name, expireAt: Date.now() + this.TTL_MS })
+      return name
+    } catch (error) {
+      this.logger.warn(`审计快照名字解析失败（id=${clean}）：${String(error)}`)
+      return null
+    }
+  }
+
   /** 用户改名/删改后清缓存（供用户服务按需调用；不调也会在 60 秒后自然过期） */
   clear(id?: string): void {
     if (id) this.cache.delete(id)

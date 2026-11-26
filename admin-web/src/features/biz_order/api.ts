@@ -10,9 +10,9 @@ export interface BizOrder {
   remark?: string | null
   createBy?: string | null
   updateBy?: string | null
-  /** 后端响应层把 createBy/updateBy 的 ID 翻译成的展示名（姓名优先，回退账号）；查不到对应用户时无此字段 */
-  createByName?: string
-  updateByName?: string
+  /** 审计人名字快照：写入时固化当时的名字，改名不影响历史；旧数据可能为空，由后端兜底补全 */
+  createByName?: string | null
+  updateByName?: string | null
   createdAt: string
   updatedAt: string
   /** 后端按字段权限移除的敏感字段名（如 amount），前端只展示掩码，不回填表单 */

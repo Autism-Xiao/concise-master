@@ -5,7 +5,6 @@ import { Repository, type ObjectLiteral, type SelectQueryBuilder } from 'typeorm
 import { isDuplicateEntryError } from '../../utils/db-error.util'
 import { BaseService } from '../../helper/crud/base.service'
 import { applySort, paginate, type Pagination } from '../../helper/paginate'
-import { TenantContext } from '../../shared/tenant/tenant.context'
 import { createTenantQb } from '../../shared/tenant/tenant-qb.factory'
 import type { DataAction } from '../../shared/permission/data-policy.util'
 import { applyResourceScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
@@ -98,11 +97,11 @@ export class CustomerService extends BaseService<CustomerEntity> {
     return super.findOneScoped(id, actor, ownerColumn, action)
   }
 
-  /** 新增：唯一键查重 + 落 createBy；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
+  /** 新增：唯一键查重（审计四要素由 BaseService 统一落）；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
   async create(dto: CreateCustomerDto): Promise<CustomerEntity> {
     await this.assertAllUnique(dto)
     try {
-      return await super.create({ ...dto, createBy: TenantContext.userId() })
+      return await super.create(dto)
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('客户与已有数据冲突（唯一约束），请检查电话是否重复')
@@ -111,12 +110,12 @@ export class CustomerService extends BaseService<CustomerEntity> {
     }
   }
 
-  /** 修改：唯一键查重（排除自身）+ 落 updateBy */
+  /** 修改：唯一键查重（排除自身），审计四要素由 BaseService 统一落 */
   async update(id: number, dto: UpdateCustomerDto, actor?: OwnerScopeActor | null): Promise<CustomerEntity> {
     await this.assertAllUnique(dto, id)
     try {
       // 行级校验收进基类：action='write'，与列表/详情的 read 规则各自独立解析
-      return await super.updateScoped(id, { ...dto, updateBy: TenantContext.userId() }, actor)
+      return await super.updateScoped(id, dto, actor)
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('客户与已有数据冲突（唯一约束），请检查电话是否重复')

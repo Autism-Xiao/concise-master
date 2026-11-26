@@ -36,13 +36,21 @@ export class CustomerEntity {
   @Column({ type: 'varchar', length: 128, nullable: true })
   remark?: string | null
 
-  @ApiPropertyOptional({ description: '创建人（用户名/账号）', nullable: true })
+  @ApiPropertyOptional({ description: '创建人用户 ID', nullable: true })
   @Column({ type: 'varchar', length: 32, nullable: true, comment: '创建人' })
   createBy?: string | null
 
-  @ApiPropertyOptional({ description: '更新人', nullable: true })
+  @ApiPropertyOptional({ description: '创建人名字快照（写入时固化，改名不影响历史）', nullable: true })
+  @Column({ type: 'varchar', length: 64, nullable: true, comment: '创建人名字快照' })
+  createByName?: string | null
+
+  @ApiPropertyOptional({ description: '更新人用户 ID', nullable: true })
   @Column({ type: 'varchar', length: 32, nullable: true, comment: '更新人' })
   updateBy?: string | null
+
+  @ApiPropertyOptional({ description: '更新人名字快照（写入时固化，改名不影响历史）', nullable: true })
+  @Column({ type: 'varchar', length: 64, nullable: true, comment: '更新人名字快照' })
+  updateByName?: string | null
 
   @ApiPropertyOptional({ description: '删除标记：0 正常 / 1 已删除' })
   @Column({ type: 'smallint', default: 0, comment: '0正常 1已删除' })

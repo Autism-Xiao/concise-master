@@ -14,14 +14,21 @@ function responseObjects(data: unknown): PlainObject[] {
   return [data]
 }
 
-const AUDIT_FIELDS = ['createBy', 'updateBy'] as const
+/** [ID 列, 快照列] 配对：快照列已有值就跳过，只给空快照补名字 */
+const AUDIT_FIELDS = [
+  ['createBy', 'createByName'],
+  ['updateBy', 'updateByName']
+] as const
 
 /**
- * 审计人名字段补全（响应层）
+ * 审计人名字段补全（响应层，历史数据兜底）
  *
- * createBy/updateBy 存的是用户 ID（32 位），本拦截器批量翻译成展示名后
- * 附加 createByName/updateByName，**保留原字段不动**（前端仍可拿 ID）。
- * 查不到对应用户时（如历史数据用户已删）不附加，前端回退显示原 ID。
+ * 新方案：createByName/updateByName 是数据库里的**快照列**，写入时固化当时的
+ * 名字，用户改名不影响历史记录。实体查出来自带这两列，本拦截器不再覆盖。
+ *
+ * 本拦截器只处理快照为空的历史数据（迁移前创建的记录）：拿 createBy/updateBy
+ * 的 ID 实时查当前名字补上。查不到对应用户（如历史数据用户已删）则不补，
+ * 前端回退显示原 ID。这样既保证新数据留痕不可变，旧数据也不至于显示一串 ID。
  *
  * 与 SensitiveInterceptor 同属"改原始数据"型拦截器，注册在它内侧（更靠后）。
  */
@@ -35,11 +42,13 @@ export class AuditNameInterceptor implements NestInterceptor {
         const objects = responseObjects(data)
         if (!objects.length) return data
 
-        // 收集所有需要翻译的 ID（去重）
+        // 只收集"快照为空"的 ID（新数据已有快照列，直接跳过，不查库）
         const ids = new Set<string>()
         for (const item of objects) {
-          for (const field of AUDIT_FIELDS) {
-            const value = item[field]
+          for (const [idField, nameField] of AUDIT_FIELDS) {
+            const snapshot = item[nameField]
+            if (typeof snapshot === 'string' && snapshot.trim()) continue
+            const value = item[idField]
             if (typeof value === 'string' && value.trim()) ids.add(value.trim())
           }
         }
@@ -47,11 +56,13 @@ export class AuditNameInterceptor implements NestInterceptor {
 
         const names = await this.userDict.getNames([...ids])
         for (const item of objects) {
-          for (const field of AUDIT_FIELDS) {
-            const value = item[field]
+          for (const [idField, nameField] of AUDIT_FIELDS) {
+            const snapshot = item[nameField]
+            if (typeof snapshot === 'string' && snapshot.trim()) continue
+            const value = item[idField]
             if (typeof value !== 'string') continue
             const name = names.get(value.trim())
-            if (name) item[`${field}Name`] = name
+            if (name) item[nameField] = name
           }
         }
         return data

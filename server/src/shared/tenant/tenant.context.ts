@@ -16,6 +16,11 @@ export interface TenantStore {
   tenantId: number | null
   /** 当前登录用户（公开接口没有） */
   userId?: string
+  /**
+   * 当前登录用户的展示名（姓名优先、回退账号），审计写入用。
+   * 只对写请求查一次库填充；读请求不填，避免每个 GET 都多一次查询。
+   */
+  displayName?: string | null
   /** 是否平台管理员（= sys_user.is_platform_admin，**不是** 角色编码） */
   isSuper: boolean
 }
@@ -58,6 +63,11 @@ export const TenantContext = {
 
   userId(): string | undefined {
     return storage.getStore()?.userId
+  },
+
+  /** 当前用户展示名（审计快照用）；读请求未加载时返回 undefined */
+  displayName(): string | null | undefined {
+    return storage.getStore()?.displayName
   },
 
   /** 手动构造一个上下文（脚本、定时任务、测试用） */

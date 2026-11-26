@@ -4,8 +4,12 @@ import { JwtService } from '@nestjs/jwt'
 import type { NextFunction, Request, Response } from 'express'
 
 import { jwtConfig, type JwtConfig } from '../../config'
+import { UserDictService } from '../user-dict/user-dict.service'
 import { TenantAccessService } from './tenant-access.service'
 import { TenantContext, type TenantStore } from './tenant.context'
+
+/** 写方法：只有这些请求需要当前用户名做审计快照，读请求不查库 */
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 /** 租户切换请求头（前端 http 层统一带上） */
 export const TENANT_HEADER = 'x-tenant-id'
@@ -28,7 +32,8 @@ export class TenantMiddleware implements NestMiddleware {
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
-    private readonly tenantAccess: TenantAccessService
+    private readonly tenantAccess: TenantAccessService,
+    private readonly userDict: UserDictService
   ) {}
 
   async use(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -70,7 +75,10 @@ export class TenantMiddleware implements NestMiddleware {
     const requested = Number(req.headers[TENANT_HEADER])
     try {
       const { tenantId, membership } = await this.tenantAccess.resolveTenant(userId, Number.isFinite(requested) && requested > 0 ? requested : null)
-      const store: TenantStore = { tenantId, userId, isSuper: membership.isSuper }
+      // 审计快照：只对写请求查一次当前用户名（实时查库，保证快照是写入瞬间的名字），
+      // 读请求不查——列表/详情由响应层拦截器兜底即可。
+      const displayName = WRITE_METHODS.has(req.method) ? await this.userDict.resolveName(userId) : undefined
+      const store: TenantStore = { tenantId, userId, isSuper: membership.isSuper, displayName }
       TenantContext.run(store, next)
     } catch (error) {
       // 归属校验失败（403）：把异常交给全局异常过滤器，保持统一响应格式
