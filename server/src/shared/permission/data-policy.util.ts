@@ -39,6 +39,31 @@ export interface ResolvedRule {
 export const SUPPORTED_OPERATORS = ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'not_in', 'like', 'self', 'dept'] as const
 export type RuleOperator = (typeof SUPPORTED_OPERATORS)[number]
 
+/**
+ * 规则作用的动作维度：权限模型 主体×资源×动作×范围 里此前缺的一维。
+ * - all：读写通用（存量规则的默认值，行为与改造前完全一致）
+ * - read / write / delete：只对相应动作生效
+ *
+ * 解析优先级：动作精确匹配 > all 通用规则 > 角色 data_scope。
+ * 参照 Odoo ir.rule（perm_read/perm_write/perm_unlink）与 Salesforce OWD（Public Read-Only）。
+ */
+export const DATA_ACTIONS = ['all', 'read', 'write', 'delete'] as const
+export type DataAction = (typeof DATA_ACTIONS)[number]
+
+/**
+ * 按动作挑规则：精确匹配优先；没有精确规则才回退 all 通用规则。
+ *
+ * 这条规则保证两件事：
+ * 1. 存量规则（action='all'）在 read/write/delete 各动作下都命中，改造前后行为一致；
+ * 2. 只要给资源配了一条 action='write'/delete 的精确规则，写路径立即改用精确规则，
+ *    读路径仍走原来的 all 规则 —— 这就是「能看全部、只改自己」的底座能力。
+ */
+export function selectRulesByAction<T extends { action?: string | null }>(rules: T[], action: DataAction): T[] {
+  const exact = rules.filter(rule => rule.action === action)
+  if (exact.length > 0) return exact
+  return rules.filter(rule => !rule.action || rule.action === 'all')
+}
+
 /** 上下文变量：规则值里可以引用当前用户，避免为每个人写一条规则 */
 export const RULE_VARIABLE_USER_ID = '$user.id'
 export const RULE_VARIABLE_USER_DEPT_IDS = '$user.deptIds'

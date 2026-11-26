@@ -5,6 +5,7 @@ import { IsIn, IsInt, IsNotEmpty, IsOptional, IsString } from 'class-validator'
 
 import { OperLog } from '../../../common/decorators/oper-log.decorator'
 import { Perms } from '../../../common/decorators/perms.decorator'
+import { DATA_ACTIONS } from '../../../shared/permission/data-policy.util'
 import { GrantService, SUBJECT_TYPES } from './grant.service'
 
 /** 登录用户的最小形态（jwt.strategy 挂到 req.user 的就是 UserEntity） */
@@ -79,6 +80,11 @@ class CreateDataRuleDto {
   @IsString()
   resource: string
 
+  @ApiPropertyOptional({ description: '作用动作：all（默认，读写通用）/ read / write / delete', enum: DATA_ACTIONS })
+  @IsOptional()
+  @IsIn(DATA_ACTIONS as unknown as string[], { message: '动作只能是 all/read/write/delete' })
+  action?: string
+
   @ApiProperty({ description: '过滤字段（实体属性名）' })
   @IsNotEmpty({ message: '过滤字段不能为空' })
   @IsString()
@@ -111,6 +117,11 @@ class UpdateDataRuleDto {
   @IsOptional()
   @IsString()
   name?: string
+
+  @ApiPropertyOptional({ description: '作用动作：all / read / write / delete', enum: DATA_ACTIONS })
+  @IsOptional()
+  @IsIn(DATA_ACTIONS as unknown as string[], { message: '动作只能是 all/read/write/delete' })
+  action?: string
 
   @ApiPropertyOptional({ description: '过滤字段' })
   @IsOptional()

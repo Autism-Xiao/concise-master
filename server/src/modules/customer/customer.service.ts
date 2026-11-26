@@ -7,6 +7,7 @@ import { BaseService } from '../../helper/crud/base.service'
 import { applySort, paginate, type Pagination } from '../../helper/paginate'
 import { TenantContext } from '../../shared/tenant/tenant.context'
 import { createTenantQb } from '../../shared/tenant/tenant-qb.factory'
+import type { DataAction } from '../../shared/permission/data-policy.util'
 import { applyResourceScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
 import { GrantService } from '../system/grant/grant.service'
 import { CreateCustomerDto, ListCustomerDto, UpdateCustomerDto } from './dto/customer.dto'
@@ -49,9 +50,10 @@ export class CustomerService extends BaseService<CustomerEntity> {
     qb: SelectQueryBuilder<Q>,
     alias: string,
     actor?: OwnerScopeActor | null,
-    ownerColumn = 'createBy'
+    ownerColumn = 'createBy',
+    action: DataAction = 'read'
   ): Promise<void> {
-    const rules = actor ? await this.grantService.getRulesForUser(actor, 'customer') : []
+    const rules = actor ? await this.grantService.getRulesForUser(actor, 'customer', action) : []
     applyResourceScope(qb, alias, rules, actor, this.policyFields, ownerColumn)
   }
 
@@ -87,8 +89,13 @@ export class CustomerService extends BaseService<CustomerEntity> {
   }
 
   /** 详情：与列表同一套 owner 收窄，列表看不见的客户按 id 也读不到 */
-  async findOneScoped(id: number, actor?: OwnerScopeActor | null): Promise<CustomerEntity> {
-    return super.findOneScoped(id, actor)
+  async findOneScoped(
+    id: number,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy',
+    action: DataAction = 'read'
+  ): Promise<CustomerEntity> {
+    return super.findOneScoped(id, actor, ownerColumn, action)
   }
 
   /** 新增：唯一键查重 + 落 createBy；并发写兜底捕获 ER_DUP_ENTRY 转 400 */
@@ -106,10 +113,10 @@ export class CustomerService extends BaseService<CustomerEntity> {
 
   /** 修改：唯一键查重（排除自身）+ 落 updateBy */
   async update(id: number, dto: UpdateCustomerDto, actor?: OwnerScopeActor | null): Promise<CustomerEntity> {
-    await this.findOneScoped(id, actor)
     await this.assertAllUnique(dto, id)
     try {
-      return await super.update(id, { ...dto, updateBy: TenantContext.userId() })
+      // 行级校验收进基类：action='write'，与列表/详情的 read 规则各自独立解析
+      return await super.updateScoped(id, { ...dto, updateBy: TenantContext.userId() }, actor)
     } catch (error) {
       if (isDuplicateEntryError(error)) {
         throw new BadRequestException('客户与已有数据冲突（唯一约束），请检查电话是否重复')
@@ -120,8 +127,7 @@ export class CustomerService extends BaseService<CustomerEntity> {
 
   /** 软删除：del_flag 置 1；软删行仍占用唯一键，与查重「含软删占用」配套 */
   async delete(id: number, actor?: OwnerScopeActor | null): Promise<void> {
-    // 先做 owner 校验，再走基类的严格写条件：共享行 / 他人创建的客户都不可删
-    await this.findOneScoped(id, actor)
-    await this.softDelete(id, { delFlag: 1 })
+    // 基类按 action='delete' 做行级校验 + 严格租户写条件，共享行 / 无权行都不可删
+    await this.softDeleteScoped(id, { delFlag: 1 }, actor)
   }
 }

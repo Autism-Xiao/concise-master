@@ -1,6 +1,6 @@
 import type { SelectQueryBuilder } from 'typeorm'
 
-import { applyPolicyScope, SUPPORTED_OPERATORS, type ResolvedRule } from './data-policy.util'
+import { applyPolicyScope, selectRulesByAction, SUPPORTED_OPERATORS, type ResolvedRule } from './data-policy.util'
 
 /**
  * 数据规则翻译层的单元测试
@@ -151,5 +151,39 @@ describe('applyPolicyScope', () => {
       'self',
       'dept'
     ])
+  })
+})
+
+describe('动作维度：selectRulesByAction', () => {
+  const r = (action?: string) => ({ id: action ?? 'all', action })
+
+  it('存量规则（all）在 read / write / delete 下都命中，行为不变', () => {
+    const rules = [r('all')]
+    expect(selectRulesByAction(rules, 'read')).toHaveLength(1)
+    expect(selectRulesByAction(rules, 'write')).toHaveLength(1)
+    expect(selectRulesByAction(rules, 'delete')).toHaveLength(1)
+  })
+
+  it('动作字段缺失时按 all 处理', () => {
+    expect(selectRulesByAction([r()], 'write')).toHaveLength(1)
+  })
+
+  it('精确规则优先，读走宽范围、写走窄范围', () => {
+    const rules = [r('all'), r('read'), r('write')]
+    expect(selectRulesByAction(rules, 'read')[0].id).toBe('read')
+    expect(selectRulesByAction(rules, 'write')[0].id).toBe('write')
+    expect(selectRulesByAction(rules, 'delete')[0].id).toBe('all')
+  })
+
+  it('没有写规则时回退 all，不会误用 read 规则', () => {
+    const rules = [r('all'), r('read')]
+    expect(selectRulesByAction(rules, 'write')[0].id).toBe('all')
+    expect(selectRulesByAction(rules, 'read')[0].id).toBe('read')
+  })
+
+  it('只配了 write 规则时，读仍走 all', () => {
+    const rules = [r('all'), r('write')]
+    expect(selectRulesByAction(rules, 'read')[0].id).toBe('all')
+    expect(selectRulesByAction(rules, 'write')[0].id).toBe('write')
   })
 })

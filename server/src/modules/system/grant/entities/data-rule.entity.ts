@@ -30,6 +30,10 @@ export class DataRuleEntity {
   @Column({ type: 'varchar', length: 64 })
   resource: string
 
+  @ApiProperty({ description: '作用动作：all=读写通用（默认）/ read / write / delete' })
+  @Column({ type: 'varchar', length: 16, default: 'all' })
+  action: string
+
   @ApiProperty({ description: '过滤字段（实体属性名，如 createBy / amount / status）' })
   @Column({ type: 'varchar', length: 64, name: 'rule_field' })
   ruleField: string

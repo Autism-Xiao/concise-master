@@ -34,8 +34,8 @@ export class SupplierV1Controller {
   @ApiOperation({ summary: '供应商详情', description: '需 supplier:list' })
   @Perms('supplier:list')
   @Get(':id')
-  findOne(@Param('id', ParseIntPipe) id: number) {
-    return this.supplierService.findOne(id)
+  findOne(@Param('id', ParseIntPipe) id: number, @Request() req: OwnerRequest) {
+    return this.supplierService.findOneScoped(id, req.user)
   }
 
   @ApiOperation({ summary: '新增供应商', description: '需 supplier:add' })
@@ -50,15 +50,15 @@ export class SupplierV1Controller {
   @Perms('supplier:update')
   @OperLog('供应商')
   @Put(':id')
-  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpdateSupplierDto) {
-    return this.supplierService.update(id, dto)
+  update(@Param('id', ParseIntPipe) id: number, @Body() dto: UpdateSupplierDto, @Request() req: OwnerRequest) {
+    return this.supplierService.updateScoped(id, dto, req.user)
   }
 
   @ApiOperation({ summary: '删除供应商', description: '需 supplier:delete' })
   @Perms('supplier:delete')
   @OperLog('供应商')
   @Delete(':id')
-  remove(@Param('id', ParseIntPipe) id: number) {
-    return this.supplierService.delete(id)
+  remove(@Param('id', ParseIntPipe) id: number, @Request() req: OwnerRequest) {
+    return this.supplierService.deleteScoped(id, req.user)
   }
 }

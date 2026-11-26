@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { DataSource, In, Repository } from 'typeorm'
 
 import { TenantContext } from '../../../shared/tenant/tenant.context'
-import type { PolicyActor, ResolvedRule } from '../../../shared/permission/data-policy.util'
+import { selectRulesByAction, type DataAction, type PolicyActor, type ResolvedRule } from '../../../shared/permission/data-policy.util'
 import { DataRuleEntity } from './entities/data-rule.entity'
 import { GrantEntity } from './entities/grant.entity'
 
@@ -141,12 +141,21 @@ export class GrantService {
   }
 
   /**
-   * 该用户在某资源上命中的数据规则（已按优先级升序）
+   * 该用户在某资源、某动作上命中的数据规则（已按优先级升序）
    *
    * 只有绑定了 rule_id 的授权才算数；没有任何规则时返回空数组，
    * 业务层据此回退旧的 data_scope 逻辑（存量行为不变）。
+   *
+   * 动作解析：精确匹配（read/write/delete）优先；没有精确规则才回退 all 通用规则。
+   * 这样存量的 all 规则行为完全不变，而底座已经具备「看本部门、只改自己」的表达力。
    */
-  async getRules(subject: GrantSubject, resource: string, tenantId: number | null): Promise<ResolvedRule[]> {    const grants = await this.loadGrants(subject, tenantId)
+  async getRules(
+    subject: GrantSubject,
+    resource: string,
+    tenantId: number | null,
+    action: DataAction = 'all'
+  ): Promise<ResolvedRule[]> {
+    const grants = await this.loadGrants(subject, tenantId)
     const ruleIds = [...new Set(grants.map(grant => grant.ruleId).filter((id): id is string => !!id))]
     if (ruleIds.length === 0) return []
 
@@ -154,8 +163,10 @@ export class GrantService {
       where: { id: In(ruleIds), resource, status: 1, delFlag: 0 },
       order: { priority: 'ASC' }
     })
+    // 一次查出该资源的全部规则，再按动作筛选：精确匹配优先，未命中回退 all。
+    const effective = selectRulesByAction(rules, action)
 
-    return rules.map(rule => ({
+    return effective.map(rule => ({
       id: rule.id,
       ruleField: rule.ruleField,
       ruleOperator: rule.ruleOperator,
@@ -172,10 +183,11 @@ export class GrantService {
    */
   async getRulesForUser(
     user: { id: string; departIds?: string | null; roles?: Array<{ id?: string }> | null },
-    resource: string
+    resource: string,
+    action: DataAction = 'all'
   ): Promise<ResolvedRule[]> {
     const subject = await this.resolveSubject(user)
-    return this.getRules(subject, resource, TenantContext.filterTenantId())
+    return this.getRules(subject, resource, TenantContext.filterTenantId(), action)
   }
 
   /* ============================ 授权管理 ============================ */
@@ -276,6 +288,7 @@ export class GrantService {
     dto: {
       name: string
       resource: string
+      action?: string
       ruleField: string
       ruleOperator: string
       ruleValue?: string | null
@@ -289,6 +302,7 @@ export class GrantService {
       tenantId: this.writeTenantId(),
       name: dto.name,
       resource: dto.resource,
+      action: dto.action ?? 'all',
       ruleField: dto.ruleField,
       ruleOperator: dto.ruleOperator,
       ruleValue: dto.ruleValue ?? null,
@@ -308,6 +322,7 @@ export class GrantService {
     id: string,
     dto: {
       name?: string
+      action?: string
       ruleField?: string
       ruleOperator?: string
       ruleValue?: string | null
@@ -320,6 +335,7 @@ export class GrantService {
     const rule = await this.ruleRepo.findOne({ where: { id, delFlag: 0 } })
     if (!rule) throw new NotFoundException('规则不存在')
     if (dto.name !== undefined) rule.name = dto.name
+    if (dto.action !== undefined) rule.action = dto.action
     if (dto.ruleField !== undefined) rule.ruleField = dto.ruleField
     if (dto.ruleOperator !== undefined) rule.ruleOperator = dto.ruleOperator
     if (dto.ruleValue !== undefined) rule.ruleValue = dto.ruleValue

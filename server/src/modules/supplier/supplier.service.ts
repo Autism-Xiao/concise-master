@@ -5,7 +5,7 @@ import { Repository, type ObjectLiteral, type SelectQueryBuilder } from 'typeorm
 import { BaseService } from '../../helper/crud/base.service'
 import { paginate, type Pagination } from '../../helper/paginate'
 import { createTenantQb } from '../../shared/tenant/tenant-qb.factory'
-import { applyPolicyScope } from '../../shared/permission/data-policy.util'
+import { applyPolicyScope, type DataAction } from '../../shared/permission/data-policy.util'
 import type { OwnerScopeActor } from '../../shared/permission/owner-scope.util'
 import { GrantService } from '../system/grant/grant.service'
 import { SupplierEntity } from './entities/supplier.entity'
@@ -33,12 +33,13 @@ export class SupplierService extends BaseService<SupplierEntity> {
     qb: SelectQueryBuilder<Q>,
     alias: string,
     actor?: OwnerScopeActor | null,
-    ownerColumn = 'createBy'
+    ownerColumn = 'createBy',
+    action: DataAction = 'read'
   ): Promise<void> {
     if (!actor) return
     if (Number(actor.isPlatformAdmin ?? 0) === 1) return
 
-    const rules = await this.grantService.getRulesForUser(actor, 'supplier')
+    const rules = await this.grantService.getRulesForUser(actor, 'supplier', action)
     const deptIds = String(actor.departIds ?? '')
       .split(',')
       .map(value => value.trim())

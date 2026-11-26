@@ -3,6 +3,7 @@ import type { DeepPartial, FindOptionsWhere, ObjectLiteral, Repository, SelectQu
 
 import { randomId32 } from '../../utils/password.util'
 import { emitChanges, shouldSkipField, toComparable, type ChangeItem } from '../../shared/audit/change-recorder'
+import type { DataAction } from '../../shared/permission/data-policy.util'
 import { applyOwnerScope, type OwnerScopeActor } from '../../shared/permission/owner-scope.util'
 import { TenantContext } from '../../shared/tenant/tenant.context'
 import { SHARED_TENANT_ID, tenantRawCondition, tenantWriteCondition } from '../../shared/tenant/tenant-scope.util'
@@ -51,10 +52,15 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
    * 内部回读不能跟着收窄，否则平台代维会被自己的数据范围挡住。
    * 这里与 listByQuery 共用同一个 applyOwnerScope，保证「列表看不见 = 详情也进不去」。
    */
-  async findOneScoped(id: number | string, actor?: OwnerScopeActor | null, ownerColumn = 'createBy'): Promise<T> {
+  async findOneScoped(
+    id: number | string,
+    actor?: OwnerScopeActor | null,
+    ownerColumn = 'createBy',
+    action: DataAction = 'read'
+  ): Promise<T> {
     const qb = this.repository.createQueryBuilder('entity')
     this.applyTenantToQuery(qb, 'entity')
-    await this.applyRowScope(qb, 'entity', actor, ownerColumn)
+    await this.applyRowScope(qb, 'entity', actor, ownerColumn, action)
     qb.andWhere('entity.id = :id', { id })
     const entity = await qb.getOne()
     if (!entity) {
@@ -74,8 +80,12 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
     qb: SelectQueryBuilder<Q>,
     alias: string,
     actor?: OwnerScopeActor | null,
-    ownerColumn = 'createBy'
+    ownerColumn = 'createBy',
+    _action: DataAction = 'read'
   ): Promise<void> {
+    // 通用实体未必有归属列（如 supplier），缺列时跳过 owner 收窄，避免生成无效 SQL。
+    // 有数据规则需求的服务覆写此方法，按 action 取规则（见 biz_order / customer / supplier）。
+    if (!this.hasProperty(ownerColumn)) return
     applyOwnerScope(qb, alias, actor, ownerColumn)
   }
 
@@ -154,7 +164,20 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
 
   /** 按 id 更新：实体有 updateTime 列且调用方未显式传入时自动补当前时间 */
   async update(id: number | string, dto: DeepPartial<T>): Promise<T> {
-    const before = await this.findOne(id)
+    return this.performUpdate(id, dto, await this.findOne(id))
+  }
+
+  /**
+   * 带行级校验的更新入口：写前按 action='write' 校验目标行是否在授权范围内。
+   *
+   * 刻意与 update 分开而不加第三参数：UserService 等子类覆写了 update，
+   * 其第三参数被用作 operatorId，直接改基类签名会破坏类型兼容。
+   */
+  async updateScoped(id: number | string, dto: DeepPartial<T>, actor?: OwnerScopeActor | null): Promise<T> {
+    return this.performUpdate(id, dto, await this.findOneScoped(id, actor, 'createBy', 'write'))
+  }
+
+  private async performUpdate(id: number | string, dto: DeepPartial<T>, before: T): Promise<T> {
     const shouldStamp = this.hasProperty('updateTime') && (dto as Record<string, unknown>).updateTime === undefined
     const payload = shouldStamp ? ({ ...dto, updateTime: new Date() } as DeepPartial<T>) : dto
     const qb = this.repository
@@ -223,6 +246,16 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
 
   /** 按 id 删除，不存在时抛 404（严格租户条件：共享行 / 跨租户行一律不可删） */
   async delete(id: number | string): Promise<void> {
+    await this.performDelete(id)
+  }
+
+  /** 带行级校验的删除入口：action='delete'，比修改更敏感，单独一个档位 */
+  async deleteScoped(id: number | string, actor?: OwnerScopeActor | null): Promise<void> {
+    await this.findOneScoped(id, actor, 'createBy', 'delete')
+    await this.performDelete(id)
+  }
+
+  private async performDelete(id: number | string): Promise<void> {
     const qb = this.repository.createQueryBuilder().delete().where('id = :id', { id })
     if (this.hasTenantColumn()) {
       const condition = tenantWriteCondition()
@@ -241,6 +274,16 @@ export class BaseService<T extends ObjectLiteral & { id: number | string }> {
    * findOne 的读范围包含 tenant_id=0 共享行，按 id 直写会把平台共享数据软删掉。
    */
   async softDelete(id: number | string, patch: DeepPartial<T>): Promise<void> {
+    await this.performSoftDelete(id, patch)
+  }
+
+  /** 带行级校验的软删入口：action='delete' */
+  async softDeleteScoped(id: number | string, patch: DeepPartial<T>, actor?: OwnerScopeActor | null): Promise<void> {
+    await this.findOneScoped(id, actor, 'createBy', 'delete')
+    await this.performSoftDelete(id, patch)
+  }
+
+  private async performSoftDelete(id: number | string, patch: DeepPartial<T>): Promise<void> {
     const qb = this.repository
       .createQueryBuilder()
       .update()
