@@ -40,9 +40,11 @@ import { Route as AuthenticatedSystemCalendarRouteImport } from './routes/_authe
 import { Route as AuthenticatedSystemCodegenRouteImport } from './routes/_authenticated/system/codegen'
 import { Route as AuthenticatedSystemConfigRouteImport } from './routes/_authenticated/system/config'
 import { Route as AuthenticatedSystemCustomersRouteImport } from './routes/_authenticated/system/customers'
+import { Route as AuthenticatedSystemDataRuleRouteImport } from './routes/_authenticated/system/data-rule'
 import { Route as AuthenticatedSystemDeptRouteImport } from './routes/_authenticated/system/dept'
 import { Route as AuthenticatedSystemDictRouteImport } from './routes/_authenticated/system/dict'
 import { Route as AuthenticatedSystemFileRouteImport } from './routes/_authenticated/system/file'
+import { Route as AuthenticatedSystemGrantRouteImport } from './routes/_authenticated/system/grant'
 import { Route as AuthenticatedSystemLevelRouteImport } from './routes/_authenticated/system/level'
 import { Route as AuthenticatedSystemLogRouteImport } from './routes/_authenticated/system/log'
 import { Route as AuthenticatedSystemMenuRouteImport } from './routes/_authenticated/system/menu'
@@ -227,6 +229,12 @@ const AuthenticatedSystemCustomersRoute =
     path: '/system/customers',
     getParentRoute: () => AuthenticatedRoute,
   } as any)
+const AuthenticatedSystemDataRuleRoute =
+  AuthenticatedSystemDataRuleRouteImport.update({
+    id: '/system/data-rule',
+    path: '/system/data-rule',
+    getParentRoute: () => AuthenticatedRoute,
+  } as any)
 const AuthenticatedSystemDeptRoute = AuthenticatedSystemDeptRouteImport.update({
   id: '/system/dept',
   path: '/system/dept',
@@ -242,6 +250,12 @@ const AuthenticatedSystemFileRoute = AuthenticatedSystemFileRouteImport.update({
   path: '/system/file',
   getParentRoute: () => AuthenticatedRoute,
 } as any)
+const AuthenticatedSystemGrantRoute =
+  AuthenticatedSystemGrantRouteImport.update({
+    id: '/system/grant',
+    path: '/system/grant',
+    getParentRoute: () => AuthenticatedRoute,
+  } as any)
 const AuthenticatedSystemLevelRoute =
   AuthenticatedSystemLevelRouteImport.update({
     id: '/system/level',
@@ -358,9 +372,11 @@ export interface FileRoutesByFullPath {
   '/system/codegen': typeof AuthenticatedSystemCodegenRoute
   '/system/config': typeof AuthenticatedSystemConfigRoute
   '/system/customers': typeof AuthenticatedSystemCustomersRoute
+  '/system/data-rule': typeof AuthenticatedSystemDataRuleRoute
   '/system/dept': typeof AuthenticatedSystemDeptRoute
   '/system/dict': typeof AuthenticatedSystemDictRoute
   '/system/file': typeof AuthenticatedSystemFileRoute
+  '/system/grant': typeof AuthenticatedSystemGrantRoute
   '/system/level': typeof AuthenticatedSystemLevelRoute
   '/system/log': typeof AuthenticatedSystemLogRouteWithChildren
   '/system/menu': typeof AuthenticatedSystemMenuRoute
@@ -407,9 +423,11 @@ export interface FileRoutesByTo {
   '/system/codegen': typeof AuthenticatedSystemCodegenRoute
   '/system/config': typeof AuthenticatedSystemConfigRoute
   '/system/customers': typeof AuthenticatedSystemCustomersRoute
+  '/system/data-rule': typeof AuthenticatedSystemDataRuleRoute
   '/system/dept': typeof AuthenticatedSystemDeptRoute
   '/system/dict': typeof AuthenticatedSystemDictRoute
   '/system/file': typeof AuthenticatedSystemFileRoute
+  '/system/grant': typeof AuthenticatedSystemGrantRoute
   '/system/level': typeof AuthenticatedSystemLevelRoute
   '/system/log': typeof AuthenticatedSystemLogRouteWithChildren
   '/system/menu': typeof AuthenticatedSystemMenuRoute
@@ -459,9 +477,11 @@ export interface FileRoutesById {
   '/_authenticated/system/codegen': typeof AuthenticatedSystemCodegenRoute
   '/_authenticated/system/config': typeof AuthenticatedSystemConfigRoute
   '/_authenticated/system/customers': typeof AuthenticatedSystemCustomersRoute
+  '/_authenticated/system/data-rule': typeof AuthenticatedSystemDataRuleRoute
   '/_authenticated/system/dept': typeof AuthenticatedSystemDeptRoute
   '/_authenticated/system/dict': typeof AuthenticatedSystemDictRoute
   '/_authenticated/system/file': typeof AuthenticatedSystemFileRoute
+  '/_authenticated/system/grant': typeof AuthenticatedSystemGrantRoute
   '/_authenticated/system/level': typeof AuthenticatedSystemLevelRoute
   '/_authenticated/system/log': typeof AuthenticatedSystemLogRouteWithChildren
   '/_authenticated/system/menu': typeof AuthenticatedSystemMenuRoute
@@ -511,9 +531,11 @@ export interface FileRouteTypes {
     | '/system/codegen'
     | '/system/config'
     | '/system/customers'
+    | '/system/data-rule'
     | '/system/dept'
     | '/system/dict'
     | '/system/file'
+    | '/system/grant'
     | '/system/level'
     | '/system/log'
     | '/system/menu'
@@ -560,9 +582,11 @@ export interface FileRouteTypes {
     | '/system/codegen'
     | '/system/config'
     | '/system/customers'
+    | '/system/data-rule'
     | '/system/dept'
     | '/system/dict'
     | '/system/file'
+    | '/system/grant'
     | '/system/level'
     | '/system/log'
     | '/system/menu'
@@ -611,9 +635,11 @@ export interface FileRouteTypes {
     | '/_authenticated/system/codegen'
     | '/_authenticated/system/config'
     | '/_authenticated/system/customers'
+    | '/_authenticated/system/data-rule'
     | '/_authenticated/system/dept'
     | '/_authenticated/system/dict'
     | '/_authenticated/system/file'
+    | '/_authenticated/system/grant'
     | '/_authenticated/system/level'
     | '/_authenticated/system/log'
     | '/_authenticated/system/menu'
@@ -858,6 +884,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedSystemCustomersRouteImport
       parentRoute: typeof AuthenticatedRoute
     }
+    '/_authenticated/system/data-rule': {
+      id: '/_authenticated/system/data-rule'
+      path: '/system/data-rule'
+      fullPath: '/system/data-rule'
+      preLoaderRoute: typeof AuthenticatedSystemDataRuleRouteImport
+      parentRoute: typeof AuthenticatedRoute
+    }
     '/_authenticated/system/dept': {
       id: '/_authenticated/system/dept'
       path: '/system/dept'
@@ -877,6 +910,13 @@ declare module '@tanstack/react-router' {
       path: '/system/file'
       fullPath: '/system/file'
       preLoaderRoute: typeof AuthenticatedSystemFileRouteImport
+      parentRoute: typeof AuthenticatedRoute
+    }
+    '/_authenticated/system/grant': {
+      id: '/_authenticated/system/grant'
+      path: '/system/grant'
+      fullPath: '/system/grant'
+      preLoaderRoute: typeof AuthenticatedSystemGrantRouteImport
       parentRoute: typeof AuthenticatedRoute
     }
     '/_authenticated/system/level': {
@@ -1055,9 +1095,11 @@ interface AuthenticatedRouteChildren {
   AuthenticatedSystemCodegenRoute: typeof AuthenticatedSystemCodegenRoute
   AuthenticatedSystemConfigRoute: typeof AuthenticatedSystemConfigRoute
   AuthenticatedSystemCustomersRoute: typeof AuthenticatedSystemCustomersRoute
+  AuthenticatedSystemDataRuleRoute: typeof AuthenticatedSystemDataRuleRoute
   AuthenticatedSystemDeptRoute: typeof AuthenticatedSystemDeptRoute
   AuthenticatedSystemDictRoute: typeof AuthenticatedSystemDictRoute
   AuthenticatedSystemFileRoute: typeof AuthenticatedSystemFileRoute
+  AuthenticatedSystemGrantRoute: typeof AuthenticatedSystemGrantRoute
   AuthenticatedSystemLevelRoute: typeof AuthenticatedSystemLevelRoute
   AuthenticatedSystemLogRoute: typeof AuthenticatedSystemLogRouteWithChildren
   AuthenticatedSystemMenuRoute: typeof AuthenticatedSystemMenuRoute
@@ -1092,9 +1134,11 @@ const AuthenticatedRouteChildren: AuthenticatedRouteChildren = {
   AuthenticatedSystemCodegenRoute: AuthenticatedSystemCodegenRoute,
   AuthenticatedSystemConfigRoute: AuthenticatedSystemConfigRoute,
   AuthenticatedSystemCustomersRoute: AuthenticatedSystemCustomersRoute,
+  AuthenticatedSystemDataRuleRoute: AuthenticatedSystemDataRuleRoute,
   AuthenticatedSystemDeptRoute: AuthenticatedSystemDeptRoute,
   AuthenticatedSystemDictRoute: AuthenticatedSystemDictRoute,
   AuthenticatedSystemFileRoute: AuthenticatedSystemFileRoute,
+  AuthenticatedSystemGrantRoute: AuthenticatedSystemGrantRoute,
   AuthenticatedSystemLevelRoute: AuthenticatedSystemLevelRoute,
   AuthenticatedSystemLogRoute: AuthenticatedSystemLogRouteWithChildren,
   AuthenticatedSystemMenuRoute: AuthenticatedSystemMenuRoute,

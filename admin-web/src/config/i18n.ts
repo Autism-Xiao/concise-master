@@ -22,6 +22,8 @@ export const zh = {
   'nav.system.users': '用户管理',
   'nav.system.menu': '菜单管理',
   'nav.system.role': '角色权限',
+  'nav.system.grant': '授权管理',
+  'nav.system.dataRule': '数据规则',
   'nav.system.dept': '部门管理',
   'nav.system.level': '职级管理',
   'nav.system.post': '岗位管理',

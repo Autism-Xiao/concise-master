@@ -52,6 +52,8 @@ export const navGroups: NavGroup[] = [
       { titleKey: 'nav.system.users', url: '/system/users', icon: Users },
       { titleKey: 'nav.system.menu', url: '/system/menu', icon: ListTree },
       { titleKey: 'nav.system.role', url: '/system/role', icon: ShieldCheck },
+      { titleKey: 'nav.system.grant', url: '/system/grant', icon: ShieldCheck },
+      { titleKey: 'nav.system.dataRule', url: '/system/data-rule', icon: ListTree },
       { titleKey: 'nav.system.dept', url: '/system/dept', icon: Network },
       { titleKey: 'nav.system.level', url: '/system/level', icon: Medal },
       { titleKey: 'nav.system.post', url: '/system/post', icon: Briefcase },

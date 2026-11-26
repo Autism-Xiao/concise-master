@@ -94,6 +94,16 @@ export const PAGE_REGISTRY: Record<string, PageEntry> = {
     titleKey: 'nav.system.role',
     icon: ShieldCheck
   },
+  '/system/grant': {
+    component: lazy(() => import('@/features/system/grant').then(m => ({ default: m.GrantPage }))),
+    titleKey: 'nav.system.grant',
+    icon: ShieldCheck
+  },
+  '/system/data-rule': {
+    component: lazy(() => import('@/features/system/data-rule').then(m => ({ default: m.DataRulePage }))),
+    titleKey: 'nav.system.dataRule',
+    icon: ListTree
+  },
   '/system/dept': {
     component: lazy(() => import('@/features/system/dept').then(m => ({ default: m.DeptPage }))),
     titleKey: 'nav.system.dept',
