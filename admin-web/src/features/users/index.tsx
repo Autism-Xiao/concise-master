@@ -1,7 +1,7 @@
 import { toastError } from '@/lib/toast-error'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ColumnDef } from '@tanstack/react-table'
-import { Archive, Droplets, Download, Plus, Search, ShieldBan, ShieldCheck, Trash2, Upload, UserCog, Users } from 'lucide-react'
+import { Archive, Droplets, Download, Plus, Search, ShieldBan, ShieldCheck, Trash2, Upload, UserCog } from 'lucide-react'
 import { toast } from 'sonner'
 import { useFeature } from '@/lib/features'
 import { Button } from '@/components/ui/button'
@@ -23,6 +23,7 @@ import { ExcelImportDialog } from '@/components/excel-import-dialog'
 import { UserLoginLogDialog } from './components/user-login-log-dialog'
 import { BatchRolesDialog } from './components/batch-roles-dialog'
 import { SuperviseDeptsDialog } from './components/supervise-depts-dialog'
+import { UserPersonalMenusDialog } from './components/user-personal-menus-dialog'
 import { BATCH_WATERMARK_MODE_LABEL, BatchWatermarkDialog } from './components/batch-watermark-dialog'
 import {
   batchAssignRoles,
@@ -47,25 +48,25 @@ import {
   type UserWritePayload
 } from './api'
 import { withOperationLog } from '@/features/system/log/api'
-import { fetchDepts, type Dept } from '@/features/system/dept/api'
+import { fetchGrants, type Grant } from '@/features/system/grant/api'
+import { fetchMenus } from '@/features/system/menu/api'
 import { toastBatchResult } from '@/lib/batch-delete'
-import { cn } from 'cn'
-import { buildDeptTree, collectSubtreeIds, DeptTreeRow, type DeptNode } from './user-dept-tree'
 import { buildUserColumns, columnLabels } from './user-columns'
 
 export function UsersPage() {
   /** 状态筛选：交给接口（serverStatus 为空串表示不筛） */
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [formOpen, setFormOpen] = useState(false)
-  /** 新增用户时要默认带上的部门（左树选中/行内 + 按钮），undefined = 不带 */
-  const [createDeptIds, setCreateDeptIds] = useState<string[] | undefined>(undefined)
   const [editing, setEditing] = useState<User | null>(null)
   const [deleting, setDeleting] = useState<User | null>(null)
   const [watermarkTarget, setWatermarkTarget] = useState<User | null>(null)
   const [vipTarget, setVipTarget] = useState<User | null>(null)
   const [superviseTarget, setSuperviseTarget] = useState<User | null>(null)
+  const [personalMenusTarget, setPersonalMenusTarget] = useState<User | null>(null)
   // 特性开关（GET /v1/features，租户视角）：监管部门能力可按租户关闭
   const superviseDeptEnabled = useFeature('rbac.superviseDept')
+  /** 用户 id → 生效中的个人授权菜单名（一次批量拉取，供列表列展示；弹窗内再按需拉详情） */
+  const [personalMenus, setPersonalMenus] = useState<Record<string, string[]>>({})
   const [importOpen, setImportOpen] = useState(false)
   const [exporting, setExporting] = useState(false)
   /** 重置密码结果：非空时弹一次性明文展示框 */
@@ -84,61 +85,7 @@ export function UsersPage() {
   /** 批量启停确认框：非空时待执行 */
   const [batchStatusTarget, setBatchStatusTarget] = useState<1 | 2 | null>(null)
 
-  /* ---------- 左侧部门树（可选过滤器：不选 = 查全部；接口失败/无部门时整块隐藏降级为单列表格） ---------- */
-  const [depts, setDepts] = useState<Dept[] | null>(null)
-  const [deptKeyword, setDeptKeyword] = useState('')
-  const [selectedDeptId, setSelectedDeptId] = useState<string | null>(null)
-  const [deptCollapsed, setDeptCollapsed] = useState<Set<string>>(new Set())
-
-  useEffect(() => {
-    // 部门树是增强能力不是依赖：拉不到就静默降级，用户管理页依然可用
-    fetchDepts()
-      .then(setDepts)
-      .catch(() => setDepts([]))
-  }, [])
-
-  const deptTree = useMemo(() => (depts ? buildDeptTree(depts) : []), [depts])
-  const deptById = useMemo(() => new Map((depts ?? []).map(d => [d.id, d])), [depts])
-  /** 选中的部门已不存在（被删/被筛掉）时回退到「全部部门」，避免右侧停在过期过滤上 */
-  useEffect(() => {
-    if (depts && selectedDeptId && !deptById.has(selectedDeptId)) setSelectedDeptId(null)
-  }, [depts, deptById, selectedDeptId])
-
-  const selectedDept = selectedDeptId ? (deptById.get(selectedDeptId) ?? null) : null
-  /** 选中部门 → 本部门 + 子孙部门 id 并集（后端 deptIds 过滤命中任一部门即返回） */
-  const selectedDeptIds = useMemo(() => {
-    if (!selectedDept) return []
-    const node = deptTree.find(root => root.id === selectedDept.id)
-    if (node) return collectSubtreeIds(node)
-    // 树里找不到（理论不可达）时兜底只过滤本部门
-    return [selectedDept.id]
-  }, [selectedDept, deptTree])
-
-  /** 部门搜索：命中名称的过滤（命中节点及其祖先链保留展开） */
-  const deptSearching = deptKeyword.trim() !== ''
-  const visibleDeptTree = useMemo(() => {
-    if (!deptSearching) return deptTree
-    const kw = deptKeyword.trim().toLowerCase()
-    const filterTree = (nodes: DeptNode[]): DeptNode[] =>
-      nodes
-        .map(node => {
-          const children = filterTree(node.children)
-          if (node.departName.toLowerCase().includes(kw) || children.length) return { ...node, children }
-          return null
-        })
-        .filter((n): n is DeptNode => n != null)
-    return filterTree(deptTree)
-  }, [deptTree, deptSearching, deptKeyword])
-
-  const toggleDept = (id: string) =>
-    setDeptCollapsed(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-
-  /** 列表查询：翻页/搜索/排序/状态/部门都由接口完成，前端只维护查询参数 */
+  /** 列表查询：翻页/搜索/排序/状态都由接口完成，前端只维护查询参数 */
   const fetchPage = useCallback(
     ({ page, pageSize, keyword, filters, sortBy, sortOrder }: ServerTableQuery<{ status: string; deptIds: string }>) =>
       fetchUserPage({
@@ -156,14 +103,36 @@ export function UsersPage() {
   const tableFilters = useMemo(
     () => ({
       status: statusFilter === 'all' ? '' : statusFilter,
-      deptIds: selectedDeptIds.join(',')
+      deptIds: '' // 部门树已移除；保留字段满足查询类型，空串 = 不过滤
     }),
-    [statusFilter, selectedDeptIds]
+    [statusFilter]
   )
 
-  const openCreate = (deptId?: string) => {
+  /** 批量拉取全部「用户主体」的授权 + 菜单表，避免列表逐行请求；授权列表接口不支持按 ids 过滤，取回后前端按主体分组 */
+  useEffect(() => {
+    if (!hasPermission('system:grant:list')) return
+    Promise.all([
+      fetchGrants({ subjectType: 'user' }).catch(() => [] as Grant[]),
+      fetchMenus().catch(() => [])
+    ])
+      .then(([grants, menus]) => {
+        const names = new Map(menus.map(menu => [menu.id, menu.name]))
+        const now = Date.now()
+        const grouped: Record<string, string[]> = {}
+        for (const grant of grants) {
+          if (grant.status !== 1 || grant.ruleEffect === 'deny') continue
+          if (grant.expireAt && new Date(grant.expireAt).getTime() <= now) continue
+          const list = grouped[grant.subjectId] ?? (grouped[grant.subjectId] = [])
+          const name = names.get(grant.permissionId) ?? grant.permissionId
+          if (!list.includes(name)) list.push(name)
+        }
+        setPersonalMenus(grouped)
+      })
+      .catch(() => setPersonalMenus({}))
+  }, [])
+
+  const openCreate = () => {
     setEditing(null)
-    setCreateDeptIds(deptId ? [deptId] : selectedDept ? selectedDeptIds : undefined)
     setFormOpen(true)
   }
 
@@ -185,12 +154,14 @@ export function UsersPage() {
         setKickTarget,
         setLogTarget,
         setSuperviseTarget,
+        setPersonalMenusTarget,
         setVipTarget,
         setDeleting,
-        superviseDeptEnabled
+        superviseDeptEnabled,
+        personalMenus
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- handler 均为渲染期闭包取最新值；superviseDeptEnabled 是普通值，特性开关异步拉到后必须重建列，否则入口永远隐藏
-    [superviseDeptEnabled]
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- handler 均为渲染期闭包取最新值；两个普通值（特性开关、个人菜单映射）异步拉到后必须重建列
+    [superviseDeptEnabled, personalMenus]
   )
 
   const statusItems = useMemo(() => ({ all: '全部状态', ...Object.fromEntries(Object.entries(userStatusMap).map(([value, { label }]) => [value, label])) }), [])
@@ -286,13 +257,12 @@ export function UsersPage() {
       .catch(e => toastError(e, '保存失败'))
   }
 
-  /** 导出 Excel：与列表同过滤条件（关键字/状态/部门），导出的是筛选后的结果（不筛选即全量） */
+  /** 导出 Excel：与列表同过滤条件（关键字/状态），导出的是筛选后的结果（不筛选即全量） */
   const handleExport = () => {
     setExporting(true)
     exportUsers({
       keyword: keyword.trim(),
-      status: statusFilter === 'all' ? '' : statusFilter,
-      deptIds: selectedDeptIds.length ? selectedDeptIds : undefined
+      status: statusFilter === 'all' ? '' : statusFilter
     })
       .then(({ filename, blob }) => {
         saveBlobFile(filename, blob)
@@ -360,14 +330,6 @@ export function UsersPage() {
     setKickTarget(null)
   }
 
-  /** 部门树刷新（保持与左侧树的加载态一致：null = 骨架屏） */
-  const reloadDepts = useCallback(() => {
-    setDepts(null)
-    fetchDepts()
-      .then(setDepts)
-      .catch(() => setDepts([]))
-  }, [])
-
   return (
     <div className="space-y-6">
       {/* 页标题：整行置顶（与其他页面惯例一致），下方才是主从网格 */}
@@ -377,7 +339,6 @@ export function UsersPage() {
           <p className="text-muted-foreground text-sm">
             {/* 服务端分页后会拿到真实总数；total=-1 说明本次跳过了 COUNT，只能报「当前页 N 条」 */}
             {total >= 0 ? `共 ${total} 个用户` : `当前页 ${pageRows.length} 个用户`}
-            {selectedDept && ` · 「${selectedDept.departName}」及下级`}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -434,66 +395,9 @@ export function UsersPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[240px_minmax(0,1fr)]">
-        {/* 左：部门树 —— 可选过滤器，不选 = 查全部；无部门/接口失败时整块隐藏，降级为单列表格 */}
-        {depts === null ? (
-          <Card className="h-fit xl:sticky xl:top-4">
-            <div className="px-3 pt-3">
-              <Skeleton className="h-6 w-24" />
-              <Skeleton className="mt-3 h-8 w-full" />
-            </div>
-            <CardContent className="space-y-2 px-3 pt-3 pb-2">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <Skeleton key={i} className="h-7 w-full" />
-              ))}
-            </CardContent>
-          </Card>
-        ) : depts.length === 0 ? null : (
-          <Card className="h-fit xl:sticky xl:top-4">
-            <div className="flex items-center justify-between px-3 pt-3">
-              <span className="text-sm font-semibold">部门</span>
-              <RefreshButton onClick={reloadDepts} className="size-7" spinning={depts === null} />
-            </div>
-            <div className="px-3 pt-2 pb-1">
-              <Input placeholder="搜索部门名称" className="h-8 text-sm" value={deptKeyword} onChange={e => setDeptKeyword(e.target.value)} />
-            </div>
-            {/* data-scroll：滚动条默认隐藏、悬停显现，与侧边栏一致 */}
-            <CardContent data-scroll="tree" className="max-h-[calc(100vh-260px)] overflow-y-auto px-2 pb-2">
-              <div className="py-1">
-                {/* 虚拟根节点：不选部门 = 不过滤（游客模式/游离账号都能看全量） */}
-                <button
-                  type="button"
-                  className={cn(
-                    'hover:bg-accent flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-start text-sm',
-                    !selectedDeptId && 'bg-accent font-medium'
-                  )}
-                  onClick={() => setSelectedDeptId(null)}
-                >
-                  <Users className="text-muted-foreground size-3.5 shrink-0" />
-                  全部部门
-                </button>
-                {visibleDeptTree.map(node => (
-                  <DeptTreeRow
-                    key={node.id}
-                    node={node}
-                    depth={1}
-                    collapsed={deptCollapsed}
-                    selectedId={selectedDeptId}
-                    onToggle={toggleDept}
-                    onSelect={dept => setSelectedDeptId(dept.id)}
-                    onAddUser={deptId => openCreate(deptId)}
-                    canAdd={hasPermission('system:user:add')}
-                  />
-                ))}
-                {visibleDeptTree.length === 0 && deptSearching && <p className="text-muted-foreground py-6 text-center text-sm">没有匹配的部门</p>}
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* 右：用户表格（部门树隐藏时自动占满整行） */}
-        {/* 注意：xl 下首列固定 240px；部门树为空时本节点是唯一子元素，会落进首列被压成 240px，必须跨两列 */}
-        <div className={cn('min-w-0', depts?.length === 0 && 'xl:col-span-2')}>
+      <div>
+        {/* 用户表格（整行铺满） */}
+        <div className="min-w-0">
           {!booted ? (
             <Card>
               <CardContent className="space-y-3 py-6">
@@ -544,11 +448,10 @@ export function UsersPage() {
 
         {formOpen && (
           <UserFormDrawer
-            key={`${editing?.id ?? 'new'}-${(createDeptIds ?? []).join(',')}`}
+            key={editing?.id ?? 'new'}
             open={formOpen}
             onOpenChange={setFormOpen}
             user={editing}
-            defaultDeptIds={createDeptIds}
             onSubmit={handleSubmit}
           />
         )}
@@ -593,6 +496,15 @@ export function UsersPage() {
             onOpenChange={v => !v && setSuperviseTarget(null)}
             user={superviseTarget}
             onSaved={reload}
+          />
+        )}
+
+        {personalMenusTarget && (
+          <UserPersonalMenusDialog
+            key={personalMenusTarget.id}
+            open={!!personalMenusTarget}
+            onOpenChange={v => !v && setPersonalMenusTarget(null)}
+            user={personalMenusTarget}
           />
         )}
 

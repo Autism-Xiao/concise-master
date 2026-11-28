@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Pencil, Plus, Trash2 } from 'lucide-react'
+import { useNavigate } from '@tanstack/react-router'
+import { Pencil, Plus, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import type { ColumnDef } from '@tanstack/react-table'
 import { Button } from '@/components/ui/button'
@@ -45,7 +46,13 @@ const columnLabels: Record<string, string> = {
 
 type NameMap = Record<string, string>
 
-export function GrantPage() {
+export interface GrantPageProps {
+  /** 从其他页跳转过来时预填的主体（如用户管理 → 配置个人菜单） */
+  prefillSubject?: { type: GrantSubjectType; id: string }
+}
+
+export function GrantPage({ prefillSubject }: GrantPageProps) {
+  const navigate = useNavigate()
   const [list, setList] = useState<Grant[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -95,7 +102,18 @@ export function GrantPage() {
     void loadNames()
   }, [])
 
-  const grants = useMemo(() => list ?? [], [list])
+  /** 带主体跳转时：列表只显示该主体的授权，主体类型下拉也切到对应值 */
+  const prefillType = prefillSubject?.type
+  const prefillId = prefillSubject?.id
+  useEffect(() => {
+    if (prefillType) setSubjectFilter(prefillType)
+  }, [prefillType, prefillId])
+
+  const grants = useMemo(() => {
+    const all = list ?? []
+    if (!prefillType || !prefillId) return all
+    return all.filter(grant => grant.subjectType === prefillType && grant.subjectId === prefillId)
+  }, [list, prefillType, prefillId])
 
   const openCreate = () => {
     setEditing(null)
@@ -227,6 +245,17 @@ export function GrantPage() {
           <p className="text-muted-foreground text-sm">
             共 {grants.length} 条例外授权 · 最终权限 = 角色权限 ∪ 个人授权，个人授权只增不减
           </p>
+          {prefillSubject && (
+            <div className="bg-info/10 text-info mt-2 flex items-center gap-2 rounded-md px-2.5 py-1.5 text-xs">
+              <span>
+                已按主体过滤：{SUBJECT_TYPE_LABELS[prefillSubject.type]} · {names[prefillSubject.type]?.[prefillSubject.id] ?? prefillSubject.id}（新增授权会自动预填该主体）
+              </span>
+              <button type="button" className="ms-auto inline-flex items-center gap-0.5 hover:underline" onClick={() => void navigate({ to: '/system/grant', search: {} })}>
+                <X className="size-3" />
+                清除过滤
+              </button>
+            </div>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           {hasPermission('system:grant:write') && (
@@ -285,7 +314,14 @@ export function GrantPage() {
       )}
 
       {formOpen && (
-        <GrantFormDialog key={editing?.id ?? 'new'} open={formOpen} onOpenChange={setFormOpen} grant={editing} onSubmit={handleSubmit} />
+        <GrantFormDialog
+          key={editing?.id ?? 'new'}
+          open={formOpen}
+          onOpenChange={setFormOpen}
+          grant={editing}
+          prefill={editing ? undefined : prefillSubject}
+          onSubmit={handleSubmit}
+        />
       )}
 
       <ConfirmDialog

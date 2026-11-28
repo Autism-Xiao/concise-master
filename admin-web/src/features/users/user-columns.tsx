@@ -13,6 +13,7 @@ import {
   Droplets,
   FileClock,
   KeyRound,
+  ListTree,
   LogOut,
   MoreHorizontal,
   Network,
@@ -33,7 +34,10 @@ export const columnLabels: Record<string, string> = {
   phone: '手机号',
   status: '状态',
   roleNames: '角色',
+  personalMenus: '个人菜单',
+  levelName: '职级',
   postNames: '岗位',
+  deptNames: '部门',
   watermark: '水印',
   createTime: '创建时间'
 }
@@ -48,9 +52,12 @@ export interface UserColumnsActions {
   setKickTarget: (user: User | null) => void
   setLogTarget: (user: User | null) => void
   setSuperviseTarget: (user: User | null) => void
+  setPersonalMenusTarget: (user: User | null) => void
   setVipTarget: (user: User | null) => void
   setDeleting: (user: User | null) => void
   superviseDeptEnabled: boolean
+  /** 用户 id → 生效中的个人授权菜单名（批量预取，避免逐行请求接口） */
+  personalMenus: Record<string, string[]>
 }
 
 export function buildUserColumns(actions: UserColumnsActions): ColumnDef<User>[] {
@@ -113,6 +120,26 @@ export function buildUserColumns(actions: UserColumnsActions): ColumnDef<User>[]
       accessorFn: row => (row.roles ?? []).map(r => r.roleName).join('、'),
       header: ({ column }) => <DataTableColumnHeader column={column} title="角色" />,
       cell: ({ row }) => row.getValue('roleNames') || '-'
+    },
+    {
+      id: 'personalMenus',
+      accessorFn: row => (actions.personalMenus[row.id] ?? []).join('、'),
+      header: ({ column }) => <DataTableColumnHeader column={column} title="个人菜单" />,
+      cell: ({ row }) => {
+        const menus = actions.personalMenus[row.original.id] ?? []
+        if (menus.length === 0) return <span className="text-muted-foreground">-</span>
+        return (
+          <button
+            type="button"
+            className="text-primary max-w-40 truncate text-start text-xs hover:underline"
+            title={`${menus.join('、')}（点击查看并配置）`}
+            onClick={() => actions.setPersonalMenusTarget(row.original)}
+          >
+            {menus.slice(0, 2).join('、')}
+            {menus.length > 2 && ` +${menus.length - 2}`}
+          </button>
+        )
+      }
     },
     {
       id: 'levelName',
@@ -231,6 +258,13 @@ export function buildUserColumns(actions: UserColumnsActions): ColumnDef<User>[]
                   <DropdownMenuItem onClick={() => actions.setLogTarget(user)}>
                     <FileClock className="size-4" />
                     登录日志
+                  </DropdownMenuItem>
+                )}
+                {/* 个人菜单（例外授权）：只读查看 sys_grant 里 subjectType=user 的授权，配置统一跳授权管理页 */}
+                {hasPermission('system:grant:list') && (
+                  <DropdownMenuItem onClick={() => actions.setPersonalMenusTarget(user)}>
+                    <ListTree className="size-4" />
+                    个人菜单
                   </DropdownMenuItem>
                 )}
                 {/* 管辖部门（ReBAC 监管数据权限）：data_scope 部门档的用户额外可见所选部门的数据；

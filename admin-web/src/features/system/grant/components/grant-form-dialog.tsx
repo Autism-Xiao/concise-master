@@ -14,6 +14,8 @@ interface GrantFormDialogProps {
   onOpenChange: (open: boolean) => void
   /** null 表示新增 */
   grant: Grant | null
+  /** 新增时预填的主体（从用户管理等页面跳转过来） */
+  prefill?: { type: GrantSubjectType; id: string }
   onSubmit: (values: GrantWritePayload) => void
 }
 
@@ -38,7 +40,7 @@ function toLocalInput(iso?: string | null): string {
   return new Date(date.getTime() - offset).toISOString().slice(0, 16)
 }
 
-export function GrantFormDialog({ open, onOpenChange, grant, onSubmit }: GrantFormDialogProps) {
+export function GrantFormDialog({ open, onOpenChange, grant, prefill, onSubmit }: GrantFormDialogProps) {
   const [form, setForm] = useState<FormState>(() =>
     grant
       ? {
@@ -49,6 +51,8 @@ export function GrantFormDialog({ open, onOpenChange, grant, onSubmit }: GrantFo
           expireAt: toLocalInput(grant.expireAt),
           reason: grant.reason ?? ''
         }
+      : prefill
+      ? { ...emptyForm, subjectType: prefill.type, subjectId: prefill.id }
       : emptyForm
   )
   const [menus, setMenus] = useState<Menu[]>([])
