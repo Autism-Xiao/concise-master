@@ -152,7 +152,8 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
       {
         username: [requiredWith('账号', minLength(3, '账号'), maxLength(100, '账号'))],
         realname: [required('姓名'), maxLength(100, '姓名')],
-        password: user ? [optional(minLength(6, '密码'), maxLength(64, '密码'))] : [requiredWith('密码', minLength(6, '密码'), maxLength(64, '密码'))],
+        // 新建/编辑都允许留空：新建留空由后端用系统默认密码并强制首次登录修改
+        password: [optional(minLength(6, '密码'), maxLength(64, '密码'))],
         phone: [optional(phone)],
         email: [optional(email)]
       },
@@ -189,7 +190,7 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
       onOpenChange={onOpenChange}
       size="lg"
       title={user ? '编辑用户' : '新增用户'}
-      description={user ? '账号不可修改；密码留空表示不修改' : '填写信息创建新用户，带 * 为必填'}
+      description={user ? '账号不可修改；密码留空表示不修改' : '填写信息创建新用户；初始密码留空则使用系统默认密码'}
       onSubmit={handleSubmit}
       submitting={submitting}
       submitDisabled={!roles || !depts || !posts}
@@ -220,17 +221,20 @@ export function UserFormDrawer({ open, onOpenChange, user, defaultDeptIds, onSub
         </div>
         <div className="space-y-2">
           <Label htmlFor="password">
-            {user ? '重置密码（留空不改）' : '初始密码'} {!user && <span className="text-destructive">*</span>}
+            {user ? '重置密码（留空不改）' : '初始密码（选填）'}
           </Label>
           <Input
             id="password"
             type="password"
             value={form.password}
             onChange={e => set('password', e.target.value)}
-            placeholder={user ? '留空表示不修改密码' : '至少 6 位'}
+            placeholder={user ? '留空表示不修改密码' : '留空使用系统默认密码，首次登录须修改'}
             maxLength={64}
             aria-invalid={!!errors.password}
           />
+          {!user && !form.password && (
+            <p className="text-xs text-muted-foreground">留空将使用系统默认密码，该用户首次登录时必须修改。</p>
+          )}
           <FieldError message={errors.password} />
         </div>
         <div className="grid grid-cols-2 gap-4">

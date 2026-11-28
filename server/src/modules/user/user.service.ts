@@ -251,15 +251,26 @@ export class UserService extends BaseService<UserEntity> {
     // 唯一性预检：数据库唯一索引不区分软删除，必须提前给出可读提示（否则并发/软删占用会以 500 暴露）
     await this.assertUniqueFields(data)
     data.id = data.id || randomId32()
+    // 密码缺省：未传时用系统配置的默认密码，并强制首次登录修改（默认密码一旦泄露风险高，必须改）
+    const usingDefaultPassword = !data.password
+    if (usingDefaultPassword) {
+      const configured = await this.systemConfig.getString('security.password.default', '')
+      data.password = configured || randomToken(12)
+    }
     if (data.password) {
-      // 强度校验放在哈希之前：策略来自 sys_config，改配置即时生效
-      await this.assertPassword(data.password, data.username)
+      // 默认密码由管理员在系统配置维护，本身可能不符合当前强度策略；且首次登录强制改，
+      // 故跳过强度校验。管理员显式指定的密码仍走完整策略校验。
+      if (!usingDefaultPassword) {
+        await this.assertPassword(data.password, data.username)
+      }
       data.password = await hashPassword(data.password)
       data.salt = null
       data.passwordExpireAt = data.passwordExpireAt ?? (await this.resolvePasswordExpireAt())
-      // sys_config「首次登录强制改密」：建号时带初始密码的用户打上 mustChangePassword 标记，
-      // 登录门禁与自助改密（clearPasswordFlags）闭环；管理员显式传 0 表示豁免
-      if (data.mustChangePassword !== 0 && (await this.systemConfig.getBoolean('security.password.forceChangeOnFirstLogin', false))) {
+      // 默认密码建号：无条件强制改密，不接受调用方豁免。
+      // 显式密码：跟随 sys_config「首次登录强制改密」开关，管理员显式传 0 表示豁免。
+      if (usingDefaultPassword) {
+        data.mustChangePassword = 1
+      } else if (data.mustChangePassword !== 0 && (await this.systemConfig.getBoolean('security.password.forceChangeOnFirstLogin', false))) {
         data.mustChangePassword = 1
       }
     }

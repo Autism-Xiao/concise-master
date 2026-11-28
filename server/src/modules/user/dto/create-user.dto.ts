@@ -13,10 +13,11 @@ export class CreateUserDto {
   @Length(1, 100)
   realname?: string
 
-  @ApiProperty({ description: '密码（6~64 位明文，服务端哈希后入库）', example: '123456', minLength: 6, maxLength: 64 })
+  @ApiPropertyOptional({ description: '密码（6~64 位明文，服务端哈希后入库；留空则使用系统默认密码并强制首次登录修改）', example: '123456', minLength: 6, maxLength: 64 })
+  @IsOptional()
   @IsString()
   @Length(6, 64, { message: '密码长度须在 6~64 位之间' })
-  password: string
+  password?: string
 
   @ApiPropertyOptional({ description: '头像 URL（可通过 /api/upload 上传获得）', maxLength: 255 })
   @IsOptional()

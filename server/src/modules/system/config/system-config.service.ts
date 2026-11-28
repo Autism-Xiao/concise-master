@@ -31,6 +31,8 @@ const DEFAULTS: Record<string, string> = {
   'security.password.requireComplexity': 'true',
   'security.password.expireDays': '90',
   'security.password.forceChangeOnFirstLogin': 'false',
+  // 新建用户未填密码时使用的初始密码；留空则回退随机口令。强制首次登录改密，见 UserService.create
+  'security.password.default': '',
   'security.login.maxFailCount': '5',
   // 平台级：未绑定 TOTP 的超管是否只能登录不能执行平台级操作（详情见 PermsGuard / AuthService.needsSuperMfa）
   'security.platformAdmin.require2fa': 'false',
