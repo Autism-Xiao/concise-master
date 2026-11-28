@@ -125,7 +125,11 @@ export class PasswordResetService {
     await this.userService.assertPassword(newPassword, user.username)
 
     await this.delRaw(key)
-    await this.userService.updatePasswordOnly(user.id, newPassword)
+    await this.userService.updatePasswordOnly(user.id, newPassword, {
+      changeType: 'forgot',
+      operatorName: user.username,
+      remark: '邮箱验证码找回'
+    })
     // 重置成功 = 旧密码可能已泄露：全量下线 + 用户级吊销标记，
     // 不然攻击者手里的旧 refreshToken 还能继续换新令牌（forgot 链路接管账号的最后一环）
     await this.userService.forceOffline(user.id)

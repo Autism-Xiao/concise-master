@@ -465,7 +465,12 @@ export class AuthService {
     }
     // 策略校验与新建用户/管理员重置同源（sys_config），避免「改密能绕过复杂度」的漏洞
     await this.userService.assertPassword(dto.newPassword, user.username)
-    await this.userService.updatePasswordOnly(userId, dto.newPassword)
+    const wasForced = (user as { mustChangePassword?: number }).mustChangePassword === 1
+    await this.userService.updatePasswordOnly(userId, dto.newPassword, {
+      changeType: 'self',
+      operatorName: user.username,
+      remark: wasForced ? '首次登录强制改密' : null
+    })
     // 自助改密成功：解除「下次登录强制改密」与密码过期标记（新有效期由管理员另行设置）
     await this.userService.clearPasswordFlags(userId)
     // 全量下线：踢会话 + 拉 refreshToken 黑名单 + 写用户级吊销标记（旧 accessToken 立即 401）

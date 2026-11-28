@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate } from '@tanstack/react-router'
-import { ArrowUpRight } from 'lucide-react'
+import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -33,7 +32,6 @@ function isActive(grant: Grant): boolean {
  * 不在这里编辑——配置统一走授权管理页，避免两套写入口。
  */
 export function UserPersonalMenusDialog({ open, onOpenChange, user }: UserPersonalMenusDialogProps) {
-  const navigate = useNavigate()
   const [grants, setGrants] = useState<Grant[] | null>(null)
   const [menuNames, setMenuNames] = useState<MenuMap>({})
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -65,7 +63,7 @@ export function UserPersonalMenusDialog({ open, onOpenChange, user }: UserPerson
 
   const goConfig = () => {
     onOpenChange(false)
-    void navigate({ to: '/system/grant', search: { subjectType: 'user', subjectId: user.id } })
+    toast.info('请在右侧用户详情的「个人权限」页签中配置')
   }
 
   return (
@@ -125,10 +123,7 @@ export function UserPersonalMenusDialog({ open, onOpenChange, user }: UserPerson
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button>
           {hasPermission('system:grant:write') && (
-            <Button onClick={goConfig}>
-              去授权管理配置
-              <ArrowUpRight className="size-4" />
-            </Button>
+            <Button onClick={goConfig}>去个人权限配置</Button>
           )}
         </DialogFooter>
       </DialogContent>

@@ -24,6 +24,7 @@ import { UserLoginLogDialog } from './components/user-login-log-dialog'
 import { BatchRolesDialog } from './components/batch-roles-dialog'
 import { SuperviseDeptsDialog } from './components/supervise-depts-dialog'
 import { UserPersonalMenusDialog } from './components/user-personal-menus-dialog'
+import { UserDetailPanel } from './components/user-detail-panel'
 import { BATCH_WATERMARK_MODE_LABEL, BatchWatermarkDialog } from './components/batch-watermark-dialog'
 import {
   batchAssignRoles,
@@ -67,6 +68,10 @@ export function UsersPage() {
   const superviseDeptEnabled = useFeature('rbac.superviseDept')
   /** 用户 id → 生效中的个人授权菜单名（一次批量拉取，供列表列展示；弹窗内再按需拉详情） */
   const [personalMenus, setPersonalMenus] = useState<Record<string, string[]>>({})
+  /** 主从布局：右侧详情选中的用户 id；不手动选时默认当前页第一行 */
+  const [activeUserId, setActiveUserId] = useState<string | null>(null)
+  /** 重置密码等操作后递增，驱动详情日志区重新加载 */
+  const [refreshToken, setRefreshToken] = useState(0)
   const [importOpen, setImportOpen] = useState(false)
   const [exporting, setExporting] = useState(false)
   /** 重置密码结果：非空时弹一次性明文展示框 */
@@ -144,6 +149,8 @@ export function UsersPage() {
   const columns = useMemo<ColumnDef<User>[]>(
     () =>
       buildUserColumns({
+        onSelect: user => setActiveUserId(user.id),
+        activeUserId: activeUserId ?? undefined,
         openEdit,
         onResetPassword: user => handleResetPassword(user),
         onUnlock: user => handleUnlock(user),
@@ -160,8 +167,8 @@ export function UsersPage() {
         superviseDeptEnabled,
         personalMenus
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- handler 均为渲染期闭包取最新值；两个普通值（特性开关、个人菜单映射）异步拉到后必须重建列
-    [superviseDeptEnabled, personalMenus]
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- handler 均为渲染期闭包取最新值；普通值异步拉到后必须重建列
+    [superviseDeptEnabled, personalMenus, activeUserId]
   )
 
   const statusItems = useMemo(() => ({ all: '全部状态', ...Object.fromEntries(Object.entries(userStatusMap).map(([value, { label }]) => [value, label])) }), [])
@@ -173,6 +180,8 @@ export function UsersPage() {
   })
   /** 当前页行数（导出按钮的可用性判断用，不能用 total —— 空搜索时 total 可能是 0 但列表有行） */
   const pageRows = table.getRowModel().rows
+  /** 详情面板当前用户：手动点击账号优先，否则取当前页第一行；翻页后自动跟随 */
+  const activeUser = pageRows.find(row => row.original.id === activeUserId)?.original ?? pageRows[0]?.original ?? null
   const selectedCount = Object.keys(rowSelection).filter(key => rowSelection[key]).length
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [batchBusy, setBatchBusy] = useState(false)
@@ -286,7 +295,10 @@ export function UsersPage() {
   /** 重置密码：成功后弹一次性明文展示框（明文只在本次响应里，后端不落库） */
   const handleResetPassword = (user: User) => {
     withOperationLog(`重置用户「${user.realname || user.username}」的密码`, () => resetUserPassword(user.id))
-      .then(result => setResetResult({ username: user.username, password: result.password }))
+      .then(result => {
+        setResetResult({ username: user.username, password: result.password })
+        setRefreshToken(token => token + 1) // 详情日志区立即看到本次重置记录
+      })
       .catch(e => toastError(e, '重置失败'))
   }
 
@@ -395,9 +407,9 @@ export function UsersPage() {
         </div>
       </div>
 
-      <div>
-        {/* 用户表格（整行铺满） */}
-        <div className="min-w-0">
+      <div className="items-start gap-4 xl:grid xl:grid-cols-[minmax(0,3fr)_minmax(0,7fr)]">
+        {/* 左：用户列表（保留勾选框与批量操作） */}
+        <div className="min-w-0 space-y-3">
           {!booted ? (
             <Card>
               <CardContent className="space-y-3 py-6">
@@ -444,6 +456,25 @@ export function UsersPage() {
               </CardContent>
             </Card>
           )}
+        </div>
+
+        {/* 右：用户详情（基本信息 / 个人权限 + 用户日志） */}
+        <div className="mt-4 min-w-0 xl:sticky xl:top-4 xl:mt-0">
+          <UserDetailPanel
+            user={activeUser}
+            refreshToken={refreshToken}
+            superviseDeptEnabled={superviseDeptEnabled}
+            onEdit={openEdit}
+            onResetPassword={handleResetPassword}
+            onStatus={setStatusTarget}
+            onKick={setKickTarget}
+            onWatermark={setWatermarkTarget}
+            onVip={setVipTarget}
+            onSupervise={setSuperviseTarget}
+            onDelete={setDeleting}
+            onPlatformAdmin={handlePlatformAdmin}
+            onReload={() => { setRefreshToken(token => token + 1); void reload() }}
+          />
         </div>
 
         {formOpen && (

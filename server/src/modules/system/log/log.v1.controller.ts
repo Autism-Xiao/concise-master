@@ -52,6 +52,12 @@ class QueryLoginLogDto extends PagerDto {
 }
 
 class QueryOperLogDto extends PagerDto {
+  @ApiPropertyOptional({ description: '操作人用户 ID 精确过滤（sys_user.id，用户详情操作日志用）', example: 'e9ca23d68d884d4ebb19d07889727dae' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(32)
+  userId?: string
+
   @ApiPropertyOptional({ description: '操作人用户名模糊过滤', example: 'admin' })
   @IsOptional()
   @IsString()

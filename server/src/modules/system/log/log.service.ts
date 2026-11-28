@@ -383,7 +383,7 @@ export class LogService {
   }
 
   /** 操作日志查询条件构造（列表与导出共用，log_type=1） */
-  private buildOperLogQb(query: { username?: string; module?: string; startTime?: string; endTime?: string; sortBy?: string; sortOrder?: 'asc' | 'desc' }) {
+  private buildOperLogQb(query: { userId?: string; username?: string; module?: string; startTime?: string; endTime?: string; sortBy?: string; sortOrder?: 'asc' | 'desc' }) {
     const qb = this.logRepository
       .createQueryBuilder('log')
       .where('log.log_type = :logType', { logType: 1 })
@@ -391,6 +391,10 @@ export class LogService {
       .addOrderBy('log.id', 'DESC')
     this.applyLogTenantScope(qb)
     applySort(qb, 'log', query, LOG_SORTABLE)
+    // 精确按操作人过滤：优先 userId，改名不影响历史归属
+    if (query.userId) {
+      qb.andWhere('log.operate_user_id = :userId', { userId: query.userId })
+    }
     if (query.username) {
       qb.andWhere('log.operate_user_name LIKE :username', { username: `%${query.username}%` })
     }
@@ -423,6 +427,7 @@ export class LogService {
   async listOperLog(query: {
     page?: number
     pageSize?: number
+    userId?: string
     username?: string
     module?: string
     startTime?: string
@@ -437,7 +442,7 @@ export class LogService {
   }
 
   /** 导出操作日志（与列表同过滤条件，不分页，上限 5 万行防拖库） */
-  async exportOperLog(query: { username?: string; module?: string; startTime?: string; endTime?: string }): Promise<SysLogEntity[]> {
+  async exportOperLog(query: { userId?: string; username?: string; module?: string; startTime?: string; endTime?: string }): Promise<SysLogEntity[]> {
     return this.buildOperLogQb(query).take(50000).getMany()
   }
 

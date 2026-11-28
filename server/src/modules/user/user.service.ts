@@ -20,6 +20,7 @@ import { describeDuplicateEntry, isDuplicateEntryError } from '../../utils/db-er
 import { encryptPassword, hashPassword, isArgon2Hash, randomId32, verifyArgon2Password } from '../../utils/password.util'
 import { assertPasswordStrength } from '../../utils/password-policy.util'
 import { SystemConfigService } from '../system/config/system-config.service'
+import { PasswordChangeLogService, type PasswordChangeType } from '../system/log/password-change-log.service'
 import { WebhookService } from '../openapi/webhook.service'
 import { DeptEntity } from '../system/dept/entities/dept.entity'
 import { PostEntity } from '../system/post/entities/post.entity'
@@ -233,6 +234,7 @@ export class UserService extends BaseService<UserEntity> {
     private readonly authUserCache: AuthUserCacheService,
     private readonly tenantAccess: TenantAccessService,
     private readonly systemConfig: SystemConfigService,
+    private readonly passwordChangeLog: PasswordChangeLogService,
     private readonly webhookService: WebhookService,
     private readonly quota: QuotaService
   ) {
@@ -336,7 +338,9 @@ export class UserService extends BaseService<UserEntity> {
     // 留一份改前快照：下面走的是自己写的事务（不是 super.update），审计要手动喂
     const before = await this.findOne(id)
     await this.assertUniqueFields(data, id)
+    let passwordChanged = false
     if (data.password) {
+      passwordChanged = true
       // 改密码同样过策略；用户名不可改，用原用户名校验「不能包含用户名」
       await this.assertPassword(data.password, data.username)
       // argon2id 自带盐，顺手把历史盐清空，避免后续误按旧算法校验
@@ -366,6 +370,15 @@ export class UserService extends BaseService<UserEntity> {
     })
     // 字段级审计：data 里的 password/salt 会被采集器的敏感字段黑名单过滤掉
     this.auditUpdate(before, data)
+    if (passwordChanged) {
+      await this.passwordChangeLog.record({
+        userId: id,
+        username: before.username,
+        changeType: 'admin_update',
+        operatorName: operator ?? TenantContext.displayName() ?? null,
+        remark: '管理员编辑用户时修改密码'
+      })
+    }
     return this.findOneDetail(id) as Promise<UserEntity>
   }
 
@@ -1311,7 +1324,11 @@ export class UserService extends BaseService<UserEntity> {
     const password = plainPassword?.trim() || randomToken(12)
     // 管理员手填的临时口令同样要过策略：否则「重置成 123456」会让全站密码基线形同虚设
     await this.assertPassword(password, user.username)
-    await this.updatePasswordOnly(id, password)
+    await this.updatePasswordOnly(id, password, {
+      changeType: 'admin_reset',
+      operatorName: TenantContext.displayName() ?? null,
+      remark: plainPassword?.trim() ? '管理员指定新密码' : '管理员留空，系统生成随机口令'
+    })
     // 管理员重置的密码视为临时口令：强制用户下次登录自行改密（安全基线）
     await this.repository.update(id, { mustChangePassword: 1 })
     await this.onlineService.kickUser(id)
@@ -1323,7 +1340,17 @@ export class UserService extends BaseService<UserEntity> {
    * - argon2id 自带盐，顺手清历史盐
    * - 按策略重算过期时间，并解除「强制改密」标记（刚改完不该再被拦一次）
    */
-  async updatePasswordOnly(id: string, plainPassword: string): Promise<void> {
+  async updatePasswordOnly(
+    id: string,
+    plainPassword: string,
+    source: {
+      changeType: PasswordChangeType
+      operatorName?: string | null
+      ip?: string | null
+      userAgent?: string | null
+      remark?: string | null
+    } = { changeType: 'self' }
+  ): Promise<void> {
     await this.repository.update(id, {
       password: await hashPassword(plainPassword),
       salt: null,
@@ -1331,6 +1358,29 @@ export class UserService extends BaseService<UserEntity> {
       mustChangePassword: 0,
       updateTime: new Date()
     })
+    // 审计流水独立记录：写失败只告警，绝不影响已完成的改密
+    const user = await this.repository.findOne({ where: { id }, select: { id: true, username: true } })
+    if (user) {
+      await this.passwordChangeLog.record({
+        userId: id,
+        username: user.username,
+        changeType: source.changeType,
+        operatorId: TenantContext.userId() ?? null,
+        operatorName: source.operatorName ?? TenantContext.displayName() ?? null,
+        ip: source.ip ?? null,
+        userAgent: source.userAgent ?? null,
+        remark: source.remark ?? null
+      })
+    }
+  }
+
+  /** 某用户的密码修改记录（用户详情日志区用） */
+  async listPasswordChangeRecords(
+    id: string,
+    query: { page?: number; pageSize?: number; startTime?: string; endTime?: string }
+  ) {
+    await this.findOne(id) // 复用可见性校验：跨租户按「不存在」处理
+    return this.passwordChangeLog.listByUser(id, query)
   }
 
   /** 按当前策略校验密码强度；auth 的自助改密复用这个方法，保证口径一致 */

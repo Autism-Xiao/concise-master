@@ -428,6 +428,41 @@ export function importUsers(file: File): Promise<UserImportResult> {
   return getApiResult<UserImportResult>('/backend-api/v1/users/import', { method: 'POST', body: form })
 }
 
+/** 密码修改记录（审计流水：自助改密/管理员重置/邮箱找回/管理员编辑） */
+export interface PasswordRecord {
+  id: string
+  userId: string
+  username: string
+  changeType: 'self' | 'admin_reset' | 'forgot' | 'admin_update'
+  operatorId?: string | null
+  operatorName?: string | null
+  ip?: string | null
+  userAgent?: string | null
+  remark?: string | null
+  createTime: string
+}
+
+export interface PasswordRecordPage {
+  records: PasswordRecord[]
+  total: number
+  current: number
+  size: number
+  pages: number
+}
+
+/** 按用户查询密码修改记录（用户详情日志区用） */
+export function fetchPasswordRecords(userId: string, page = 1, pageSize = 10): Promise<PasswordRecordPage> {
+  const qs = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
+  return getApiResult<PasswordRecordPage>(`/backend-api/v1/users/${userId}/password-records?${qs.toString()}`)
+}
+
+export const PASSWORD_CHANGE_TYPE_LABELS: Record<PasswordRecord['changeType'], string> = {
+  self: '本人修改',
+  admin_reset: '管理员重置',
+  forgot: '邮箱找回',
+  admin_update: '管理员编辑'
+}
+
 /** 状态展示映射（对齐后端 1 正常 / 2 冻结） */
 export const userStatusMap: Record<number, { label: string; className: string }> = {
   1: { label: '正常', className: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' },

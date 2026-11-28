@@ -4,6 +4,7 @@ import { FileInterceptor } from '@nestjs/platform-express'
 import type { Response } from 'express'
 
 import { BatchDeleteDto } from '../../common/dto/batch-delete.dto'
+import { PagerDto } from '../../common/dto/pager.dto'
 import { Perms } from '../../common/decorators/perms.decorator'
 import { FeatureFlag } from '../../common/decorators/feature-flag.decorator'
 import { OperLog } from '../../common/decorators/oper-log.decorator'
@@ -322,6 +323,16 @@ export class UserV1Controller {
   @Put(':id/password')
   resetPassword(@Param('id') id: string, @Body() dto: ResetUserPasswordDto) {
     return this.userService.resetPassword(id, dto.password)
+  }
+
+  @ApiOperation({
+    summary: '某用户的密码修改记录（v1）',
+    description: '按用户分页查询改密流水（自助改密/管理员重置/邮箱找回/管理员编辑）；需 system:user:reset-password'
+  })
+  @Perms('system:user:reset-password')
+  @Get(':id/password-records')
+  listPasswordRecords(@Param('id') id: string, @Query() query: PagerDto) {
+    return this.userService.listPasswordChangeRecords(id, query)
   }
 
   @ApiOperation({ summary: '冻结/解冻（v1）', description: 'status：1 正常 / 2 冻结；冻结自动踢掉全部在线会话；内置 admin 不允许冻结；需 system:user:update' })

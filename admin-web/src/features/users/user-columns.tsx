@@ -7,6 +7,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { StatusBadge } from '@/components/status-badge'
 import { DataTableColumnHeader, selectColumn } from '@/components/data-table'
 import { getUsername, hasPermission } from '@/lib/auth'
+import { cn } from '@/lib/utils'
 import { withOperationLog } from '@/features/system/log/api'
 import {
   BadgeCheck,
@@ -42,6 +43,10 @@ export const columnLabels: Record<string, string> = {
   createTime: '创建时间'
 }
 export interface UserColumnsActions {
+  /** 点击账号：右侧详情切换到该用户 */
+  onSelect: (user: User) => void
+  /** 当前详情选中的用户 id（账号列高亮） */
+  activeUserId?: string
   openEdit: (user: User) => void
   onResetPassword: (user: User) => void
   onUnlock: (user: User) => void
@@ -67,8 +72,16 @@ export function buildUserColumns(actions: UserColumnsActions): ColumnDef<User>[]
       accessorKey: 'username',
       header: ({ column }) => <DataTableColumnHeader column={column} title="账号" />,
       cell: ({ row }) => (
-        // 用内联徽标而不是单开一列：平台管理员通常只有一两个，加列会把表格再挤宽 80px
-        <span className="flex items-center gap-1.5 font-medium whitespace-nowrap">
+        // 账号可点：主从布局里点账号切换右侧详情；徽标仍内联，不额外占列宽
+        <button
+          type="button"
+          title="查看该用户详情"
+          onClick={() => actions.onSelect(row.original)}
+          className={cn(
+            'hover:text-primary flex max-w-full items-center gap-1.5 whitespace-nowrap font-medium underline-offset-2 hover:underline',
+            row.original.id === actions.activeUserId && 'text-primary'
+          )}
+        >
           {row.getValue('username')}
           {Number(row.original.isPlatformAdmin) === 1 && (
             <span
@@ -86,7 +99,7 @@ export function buildUserColumns(actions: UserColumnsActions): ColumnDef<User>[]
               VIP
             </span>
           )}
-        </span>
+        </button>
       )
     },
     {

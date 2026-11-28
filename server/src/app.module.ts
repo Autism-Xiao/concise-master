@@ -29,6 +29,7 @@ import { AuthModule } from './modules/auth/auth.module'
 import { RoleModule } from './modules/role/role.module'
 import { MenuModule } from './modules/menu/menu.module'
 import { LogModule } from './modules/system/log/log.module'
+import { PasswordChangeLogModule } from './modules/system/log/password-change-log.module'
 import { DeptModule } from './modules/system/dept/dept.module'
 import { ScheduleModule } from './modules/schedule/schedule.module'
 import { RegionModule } from './modules/system/region/region.module'
@@ -111,6 +112,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule()
     RoleModule,
     MenuModule,
     LogModule,
+    PasswordChangeLogModule,
     DeptModule,
     ScheduleModule,
     RegionModule,
